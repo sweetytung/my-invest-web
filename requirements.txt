@@ -4,3 +4,4 @@ yfinance
 twstock
 plotly
 gunicorn
+lxml
