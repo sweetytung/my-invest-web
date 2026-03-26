@@ -2,8 +2,13 @@ from flask import Flask, request, render_template_string
 import math
 import difflib
 import os
+from datetime import datetime
 from typing import Tuple, Optional
+from urllib.parse import quote
+from email.utils import parsedate_to_datetime
+import xml.etree.ElementTree as ET
 
+import requests
 import pandas as pd
 import yfinance as yf
 import twstock
@@ -225,6 +230,201 @@ def safe_float(x, digits: int = 2):
         return None
 
 
+
+
+def safe_text(x, default="-"):
+    try:
+        if x is None:
+            return default
+        s = str(x).strip()
+        return s if s else default
+    except Exception:
+        return default
+
+
+def get_news_search_terms(symbol: str, query: str) -> list:
+    display_name = get_display_name(query, symbol)
+    terms = []
+
+    for candidate in [query, display_name, symbol]:
+        value = safe_text(candidate, "").strip()
+        if not value:
+            continue
+        if value not in terms:
+            terms.append(value)
+
+    symbol_upper = (symbol or "").upper().strip()
+    alias_map = {
+        "^TWII": ["台股", "台灣加權指數", "加權指數"],
+        "USDTWD=X": ["美元兌台幣", "美元 台幣"],
+        "AUDTWD=X": ["澳幣兌台幣", "澳幣 台幣"],
+        "JPYTWD=X": ["日圓兌台幣", "日圓 台幣"],
+        "EURTWD=X": ["歐元兌台幣", "歐元 台幣"],
+        "GC=F": ["黃金", "金價"],
+        "CL=F": ["原油", "油價"],
+        "BZ=F": ["布蘭特原油", "油價"],
+        "TLT": ["美債", "20年美債"],
+        "IEF": ["美債", "7-10年美債"],
+    }
+
+    for alias in alias_map.get(symbol_upper, []):
+        if alias not in terms:
+            terms.append(alias)
+
+    return terms
+
+
+def fetch_google_news_zh(search_term: str, limit: int = 8):
+    items = []
+    try:
+        rss_url = f"https://news.google.com/rss/search?q={quote(search_term)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(rss_url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.text)
+
+        for node in root.findall("./channel/item"):
+            title = safe_text(node.findtext("title"), "")
+            link = safe_text(node.findtext("link"), "")
+            provider = safe_text(node.findtext("source"), "Google News")
+            pub_date = safe_text(node.findtext("pubDate"), "")
+
+            published = "時間未提供"
+            if pub_date:
+                try:
+                    published = parsedate_to_datetime(pub_date).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    published = pub_date
+
+            if not title or not link:
+                continue
+
+            items.append({
+                "title": title,
+                "link": link,
+                "provider": provider,
+                "published": published,
+            })
+
+            if len(items) >= limit:
+                break
+    except Exception:
+        return []
+
+    return items
+
+
+def fetch_yfinance_news(symbol: str, limit: int = 8):
+    news_items = []
+    try:
+        raw_news = yf.Ticker(symbol).news or []
+    except Exception:
+        raw_news = []
+
+    for item in raw_news:
+        try:
+            title = item.get("title") or item.get("content", {}).get("title")
+            link = item.get("link") or item.get("content", {}).get("canonicalUrl", {}).get("url")
+            provider = item.get("publisher") or item.get("content", {}).get("provider", {}).get("displayName")
+            published_ts = item.get("providerPublishTime") or item.get("content", {}).get("pubDate")
+            published_text = ""
+
+            if isinstance(published_ts, (int, float)):
+                published_text = datetime.fromtimestamp(published_ts).strftime("%Y-%m-%d %H:%M")
+            elif isinstance(published_ts, str):
+                published_text = published_ts.replace("T", " ")[:16]
+
+            if not title or not link:
+                continue
+
+            news_items.append({
+                "title": str(title).strip(),
+                "link": str(link).strip(),
+                "provider": safe_text(provider, "新聞來源"),
+                "published": safe_text(published_text, "時間未提供"),
+            })
+        except Exception:
+            continue
+
+        if len(news_items) >= limit:
+            break
+
+    return news_items
+
+
+def get_related_news(symbol: str, query: str, limit: int = 8):
+    news_items = []
+    seen = set()
+
+    search_terms = get_news_search_terms(symbol, query)
+    for term in search_terms:
+        for item in fetch_google_news_zh(term, limit=limit):
+            link = safe_text(item.get("link"), "")
+            title = safe_text(item.get("title"), "")
+            if not title or not link or link in seen:
+                continue
+            seen.add(link)
+            news_items.append(item)
+            if len(news_items) >= limit:
+                return news_items
+
+    for item in fetch_yfinance_news(symbol, limit=limit):
+        link = safe_text(item.get("link"), "")
+        title = safe_text(item.get("title"), "")
+        if not title or not link or link in seen:
+            continue
+        seen.add(link)
+        news_items.append(item)
+        if len(news_items) >= limit:
+            return news_items
+
+    if not news_items and query:
+        news_items.append({
+            "title": f"目前抓不到 {query} 的中文即時新聞，可稍後再試。",
+            "link": "",
+            "provider": "系統訊息",
+            "published": "-",
+        })
+
+    return news_items
+
+
+def create_market_trend_html(symbol: str = "^TWII", title: str = "台股大盤即時走勢") -> str:
+    try:
+        df = yf.Ticker(symbol).history(period="1d", interval="5m", auto_adjust=False)
+        if df.empty:
+            df = yf.Ticker(symbol).history(period="5d", interval="1d", auto_adjust=False)
+        if df.empty:
+            return '<div class="empty-block">目前抓不到大盤即時走勢資料。</div>'
+
+        last_close = float(df["Close"].iloc[-1])
+        first_open = float(df["Open"].iloc[0]) if "Open" in df.columns and len(df) > 0 else last_close
+        change = last_close - first_open
+        change_pct = (change / first_open * 100) if first_open else 0
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df.index, y=df["Close"], mode="lines", name="大盤走勢"))
+        fig.update_layout(
+            height=320,
+            margin=dict(l=20, r=20, t=40, b=20),
+            template="plotly_white",
+            title=title,
+            xaxis_title="時間",
+            yaxis_title="指數",
+        )
+
+        summary_class = "score-good" if change >= 0 else "score-weak"
+        summary = f"""
+        <div class="market-summary {summary_class}">
+            最新指數：<strong>{round(last_close, 2)}</strong>
+            ｜ 今日漲跌：<strong>{round(change, 2)}</strong>
+            ｜ 漲跌幅：<strong>{round(change_pct, 2)}%</strong>
+        </div>
+        """
+        return summary + fig.to_html(full_html=False, include_plotlyjs="cdn")
+    except Exception:
+        return '<div class="empty-block">目前抓不到大盤即時走勢資料。</div>'
+
 def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -350,6 +550,79 @@ def get_history(symbol: str) -> Tuple[pd.DataFrame, str]:
             return hist_alt, alt
 
     return hist, symbol
+
+
+def get_tw_stock_name_by_symbol(symbol: str) -> Optional[str]:
+    symbol_upper = (symbol or '').upper().strip()
+    for _, info in twstock.codes.items():
+        try:
+            stock_code = str(info.code).strip()
+            stock_name = str(info.name).strip()
+            market = str(info.market).strip()
+            suffix = market_to_yf_suffix(market)
+            if suffix and f"{stock_code}{suffix}".upper() == symbol_upper:
+                return stock_name
+        except Exception:
+            continue
+    return None
+
+
+def get_display_name(query: str, symbol: str) -> str:
+    query = (query or '').strip()
+    symbol_upper = (symbol or '').upper().strip()
+
+    reverse_keyword_map = {v.upper(): k for k, v in KEYWORD_MAP.items()}
+    preferred_names = {
+        'USDTWD=X': '美元兌台幣',
+        'AUDTWD=X': '澳幣兌台幣',
+        'JPYTWD=X': '日圓兌台幣',
+        'EURTWD=X': '歐元兌台幣',
+        'TLT': '20年美債 ETF',
+        'IEF': '7-10年美債 ETF',
+        'SHY': '短天期美債 ETF',
+        'LQD': '投資等級債 ETF',
+        'HYG': '高收益債 ETF',
+        'BND': '總體債券 ETF',
+        'EMB': '新興市場債 ETF',
+        '^TWII': '台灣加權指數',
+        'GC=F': '黃金',
+        'SI=F': '白銀',
+        'PL=F': '白金',
+        'PA=F': '鈀金',
+        'CL=F': '紐約原油',
+        'BZ=F': '布蘭特原油',
+        'NG=F': '天然氣',
+        'HG=F': '銅',
+        'ZC=F': '玉米',
+        'ZS=F': '黃豆',
+        'ZW=F': '小麥',
+        'KC=F': '咖啡',
+        'CC=F': '可可',
+        'CT=F': '棉花',
+    }
+
+    tw_name = get_tw_stock_name_by_symbol(symbol_upper)
+    if tw_name:
+        return tw_name
+
+    if symbol_upper in preferred_names:
+        return preferred_names[symbol_upper]
+
+    info_name = None
+    try:
+        info = yf.Ticker(symbol_upper).info
+        info_name = info.get('shortName') or info.get('longName') or info.get('displayName')
+    except Exception:
+        info_name = None
+
+    if info_name and str(info_name).strip():
+        return str(info_name).strip()
+
+    reverse_name = reverse_keyword_map.get(symbol_upper)
+    if reverse_name:
+        return reverse_name
+
+    return query or symbol_upper
 
 # =========================================================
 # 4) 指標 / 葛蘭碧
@@ -808,10 +1081,12 @@ def create_chart_html(hist: pd.DataFrame, asset_type_label: str) -> str:
 # 7) 結果整理
 # =========================================================
 def build_result_dict(title: str, asset_type_label: str, query: str, symbol: str, hist: pd.DataFrame, m: dict, scored: dict, cost_info=None):
+    display_name = get_display_name(query, symbol)
     digits = 4 if asset_type_label == "匯率" else 2
     return {
         "title": f"{title}｜{query}",
         "asset_type": asset_type_label,
+        "name": display_name,
         "symbol": symbol,
         "close": safe_float(m["close"], digits),
         "sma5": safe_float(m["sma5"], digits),
@@ -837,6 +1112,8 @@ def build_result_dict(title: str, asset_type_label: str, query: str, symbol: str
         "granville_reason": scored.get("granville_reason"),
         "cost_info": cost_info,
         "chart_html": create_chart_html(hist, asset_type_label),
+        "news_items": get_related_news(symbol, query),
+        "market_trend_html": create_market_trend_html(),
     }
 
 
@@ -952,6 +1229,20 @@ def format_analysis_html(result: dict):
         """
 
     chart_html = result.get("chart_html", "")
+    market_trend_html = result.get("market_trend_html", "")
+    news_items = result.get("news_items", [])
+
+    news_rows = []
+    for item in news_items:
+        title = safe_text(item.get("title"))
+        link = safe_text(item.get("link"), "")
+        provider = safe_text(item.get("provider"))
+        published = safe_text(item.get("published"))
+        if link:
+            news_rows.append(f'<li><a href="{link}" target="_blank" rel="noopener noreferrer">{title}</a><br><small>{provider}｜{published}</small></li>')
+        else:
+            news_rows.append(f'<li>{title}<br><small>{provider}｜{published}</small></li>')
+    news_html = "".join(news_rows)
 
     return f"""
     <div class="result-card">
@@ -961,6 +1252,7 @@ def format_analysis_html(result: dict):
         </div>
 
         <div class="grid">
+            <div class="item"><span>名稱</span><strong>{result.get('name')}</strong></div>
             <div class="item"><span>查詢代碼</span><strong>{result.get('symbol')}</strong></div>
             <div class="item"><span>資產類型</span><strong>{result.get('asset_type')}</strong></div>
             <div class="item"><span>現價</span><strong>{result.get('close')}</strong></div>
@@ -995,17 +1287,28 @@ def format_analysis_html(result: dict):
 
         <div class="section">
             <h3>風險提醒</h3>
-            <ul>{risks_html if risks_html else "<li>無</li>"}</ul>
+            <ul>{risks_html if risks_html else '<li>無</li>'}</ul>
         </div>
 
         {cost_block}
 
         <div class="section">
+            <h3>台股大盤即時走勢</h3>
+            {market_trend_html}
+        </div>
+
+        <div class="section">
             <h3>技術圖表</h3>
             {chart_html}
         </div>
+
+        <div class="section">
+            <h3>相關即時新聞</h3>
+            <ul>{news_html if news_html else '<li>目前抓不到相關新聞。</li>'}</ul>
+        </div>
     </div>
     """
+
 
 
 HTML_TEMPLATE = """
@@ -1044,6 +1347,10 @@ HTML_TEMPLATE = """
         ul { margin: 0; padding-left: 20px; line-height: 1.8; }
         .quick-links { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 10px; }
         .quick-links a { display: inline-block; padding: 8px 12px; border-radius: 999px; background: #e0e7ff; color: #3730a3; text-decoration: none; font-size: 14px; }
+        .market-summary { padding: 12px 14px; border-radius: 12px; font-weight: 700; margin-bottom: 12px; }
+        .empty-block { background: #f8fafc; border: 1px solid #e5e7eb; padding: 14px; border-radius: 12px; color: #6b7280; }
+        .section a { color: #1d4ed8; text-decoration: none; }
+        .section a:hover { text-decoration: underline; }
         @media (max-width: 900px) {
             form { grid-template-columns: 1fr; }
             .grid { grid-template-columns: repeat(2, 1fr); }
@@ -1059,7 +1366,7 @@ HTML_TEMPLATE = """
     <div class="container">
         <div class="card">
             <h1>投資查詢平台</h1>
-            <div class="sub">支援台股、台灣加權指數、匯率、原物料、債券 ETF、成本價分析、葛蘭碧八大法則、K線圖 + RSI + KD 圖表</div>
+            <div class="sub">支援台股、台灣加權指數、匯率、原物料、債券 ETF、成本價分析、葛蘭碧八大法則、K線圖 + RSI + KD 圖表、中文即時新聞</div>
 
             <form method="post">
                 <input type="text" name="query" placeholder="例如：台積電、0050、台灣加權指數、美元、黃金、美債" value="{{ query or '' }}" required>
