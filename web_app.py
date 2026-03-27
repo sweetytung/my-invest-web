@@ -932,6 +932,23 @@ def format_analysis_html(result: dict):
         latest_eps = fundamentals.get("latest_eps")
         net_margin = fundamentals.get("net_margin")
         operating_margin = fundamentals.get("operating_margin")
+
+        def metric_level(value, excellent=None, good=None, weak=None):
+            if value is None:
+                return "未取得"
+            if excellent is not None and value >= excellent:
+                return "優"
+            if good is not None and value >= good:
+                return "良"
+            if weak is not None and value < weak:
+                return "偏弱"
+            return "普通"
+
+        eps_sum_level = metric_level(eps_sum_4q, excellent=10, good=5, weak=0)
+        latest_eps_level = metric_level(latest_eps, excellent=3, good=1, weak=0)
+        net_margin_level = metric_level(net_margin, excellent=10, good=5, weak=0)
+        operating_margin_level = metric_level(operating_margin, excellent=15, good=10, weak=0)
+
         fundamental_block = f"""
         <div class="section">
             <h3>基本面評分</h3>
@@ -943,6 +960,63 @@ def format_analysis_html(result: dict):
                 <div class="item wide"><span>基本面條件</span><strong>1. 近4季 EPS >= 5　2. 單季稅後淨利率 >= 5%　3. 單季營業利益率 >= 10%</strong></div>
                 <div class="item wide"><span>資料說明</span><strong>{fundamentals.get('source_note', '無')}</strong></div>
             </div>
+        </div>
+        <div class="section">
+            <h3>基本面判讀標準表</h3>
+            <div class="table-wrap">
+                <table class="score-table">
+                    <thead>
+                        <tr>
+                            <th>指標</th>
+                            <th>優</th>
+                            <th>良</th>
+                            <th>普通</th>
+                            <th>偏弱</th>
+                            <th>目前判讀</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>近4季 EPS 合計</td>
+                            <td>>= 10</td>
+                            <td>>= 5</td>
+                            <td>0 ~ 4.99</td>
+                            <td>< 0</td>
+                            <td>{eps_sum_level}</td>
+                        </tr>
+                        <tr>
+                            <td>最新單季 EPS</td>
+                            <td>>= 3</td>
+                            <td>>= 1</td>
+                            <td>0 ~ 0.99</td>
+                            <td>< 0</td>
+                            <td>{latest_eps_level}</td>
+                        </tr>
+                        <tr>
+                            <td>單季稅後淨利率</td>
+                            <td>>= 10%</td>
+                            <td>>= 5%</td>
+                            <td>0% ~ 4.99%</td>
+                            <td>< 0%</td>
+                            <td>{net_margin_level}</td>
+                        </tr>
+                        <tr>
+                            <td>單季營業利益率</td>
+                            <td>>= 15%</td>
+                            <td>>= 10%</td>
+                            <td>0% ~ 9.99%</td>
+                            <td>< 0%</td>
+                            <td>{operating_margin_level}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <ul>
+                <li>近4季 EPS 合計：看最近一年整體獲利能力。</li>
+                <li>最新單季 EPS：看最近一季獲利是否正在轉強或轉弱。</li>
+                <li>單季稅後淨利率：看公司最後真正留下多少利潤。</li>
+                <li>單季營業利益率：看公司本業獲利能力是否夠強。</li>
+            </ul>
         </div>
         """
 
@@ -1026,7 +1100,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>投資查詢平台 v9</title>
+    <title>投資查詢平台 v10</title>
     <style>
         body { margin: 0; font-family: "Microsoft JhengHei", Arial, sans-serif; background: #f5f7fb; color: #1f2937; }
         .container { max-width: 1200px; margin: 30px auto; padding: 20px; }
@@ -1053,6 +1127,11 @@ HTML_TEMPLATE = """
         .wide { grid-column: span 2; }
         .section { margin-top: 22px; }
         .section h3 { margin-bottom: 10px; }
+        .table-wrap { overflow-x: auto; }
+        .score-table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 12px; overflow: hidden; border: 1px solid #e5e7eb; }
+        .score-table th, .score-table td { padding: 12px; border-bottom: 1px solid #e5e7eb; text-align: left; font-size: 14px; }
+        .score-table th { background: #eff6ff; color: #1e3a8a; }
+        .score-table tr:last-child td { border-bottom: none; }
         ul { margin: 0; padding-left: 20px; line-height: 1.8; }
         .quick-links { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 10px; }
         .quick-links a { display: inline-block; padding: 8px 12px; border-radius: 999px; background: #e0e7ff; color: #3730a3; text-decoration: none; font-size: 14px; }
@@ -1063,7 +1142,7 @@ HTML_TEMPLATE = """
 <body>
     <div class="container">
         <div class="card">
-            <h1>投資查詢平台 v9</h1>
+            <h1>投資查詢平台 v10</h1>
             <div class="sub">
                 支援台股、美股、英股、台灣加權指數、匯率、原物料、債券 ETF。<br>
                 內建 KD、RSI、均線、量能、葛蘭碧八大法則、成本價分析，並新增高殖利率股建議、自動估算殖利率，以及 EPS / 淨利率 / 營業利益率基本面評分。
