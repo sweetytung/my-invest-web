@@ -396,15 +396,6 @@ def get_fundamental_metrics(symbol: str, asset_type: str):
         except Exception:
             shares = None
 
-        eps_sum_4q = None
-        latest_eps = None
-        if shares:
-            eps_series = (net_income / shares).dropna()
-            if len(eps_series) >= 4:
-                eps_sum_4q = float(eps_series.iloc[:4].sum())
-            if len(eps_series) >= 1:
-                latest_eps = float(eps_series.iloc[0])
-
         latest_revenue = revenue.iloc[0] if len(revenue) >= 1 else None
         latest_net_income = net_income.iloc[0] if len(net_income) >= 1 else None
         latest_operating_income = operating_income.iloc[0] if len(operating_income) >= 1 else None
@@ -418,11 +409,9 @@ def get_fundamental_metrics(symbol: str, asset_type: str):
                 operating_margin = float(latest_operating_income) / float(latest_revenue) * 100
 
         return {
-            "eps_sum_4q": round(eps_sum_4q, 2) if eps_sum_4q is not None else None,
-            "latest_eps": round(latest_eps, 2) if latest_eps is not None else None,
             "net_margin": round(net_margin, 2) if net_margin is not None else None,
             "operating_margin": round(operating_margin, 2) if operating_margin is not None else None,
-            "source_note": "以 Yahoo Finance 季報資料估算；EPS 為近4季單季 EPS 合計。",
+            "source_note": "以 Yahoo Finance 季報資料估算。",
         }
     except Exception:
         return None
@@ -576,19 +565,8 @@ def score_signal(m: dict, asset_type: str, fundamentals: Optional[dict] = None):
 
     if asset_type in {"stock", "us_stock", "uk_stock"}:
         if fundamentals:
-            eps_sum_4q = fundamentals.get("eps_sum_4q")
             net_margin = fundamentals.get("net_margin")
             operating_margin = fundamentals.get("operating_margin")
-
-            if eps_sum_4q is not None:
-                if eps_sum_4q >= 5:
-                    score += 2
-                    reasons.append(f"近4季 EPS 合計 {eps_sum_4q}，達到 >= 5")
-                else:
-                    score -= 2
-                    reasons.append(f"近4季 EPS 合計 {eps_sum_4q}，未達 >= 5")
-            else:
-                reasons.append("近4季 EPS 暫時抓不到")
 
             if net_margin is not None:
                 if net_margin >= 5:
@@ -610,7 +588,7 @@ def score_signal(m: dict, asset_type: str, fundamentals: Optional[dict] = None):
             else:
                 reasons.append("單季營業利益率暫時抓不到")
         else:
-            reasons.append("基本面財報資料暫時抓不到，未納入 EPS / 利潤率加分")
+            reasons.append("基本面財報資料暫時抓不到，未納入利潤率加分")
     if close is not None and support is not None and close > 0:
         if (close - support) / close * 100 <= 3:
             risk_note.append("價格很接近近期支撐，若跌破要小心")
@@ -685,7 +663,7 @@ def analyze_dividend_yield(dividend_yield: Optional[float], estimated: bool = Fa
     if dividend_yield >= 8:
         return {"is_high_yield": "是", "yield_level": "高殖利率", "yield_advice": f"{source_prefix}殖利率偏高，可列入高殖利率股觀察，但要先確認是否為股價下跌造成的高殖利率。", "yield_source": source_prefix}
     if dividend_yield >= 6:
-        return {"is_high_yield": "偏高", "yield_level": "中高殖利率", "yield_advice": f"{source_prefix}殖利率不錯，可搭配近年配息穩定性、EPS 與配息率一起評估。", "yield_source": source_prefix}
+        return {"is_high_yield": "偏高", "yield_level": "中高殖利率", "yield_advice": f"{source_prefix}殖利率不錯，可搭配近年配息穩定性與配息率一起評估。", "yield_source": source_prefix}
     if dividend_yield >= 4:
         return {"is_high_yield": "普通", "yield_level": "一般殖利率", "yield_advice": f"{source_prefix}殖利率屬一般水準，適合和成長性、技術面一起綜合判斷。", "yield_source": source_prefix}
     return {"is_high_yield": "否", "yield_level": "低殖利率", "yield_advice": f"{source_prefix}殖利率偏低，較不屬於高殖利率股，若投資目標是現金流，可再比較其他標的。", "yield_source": source_prefix}
@@ -928,95 +906,18 @@ def format_analysis_html(result: dict):
     fundamentals = result.get("fundamentals") or {}
     fundamental_block = ""
     if result.get("show_dividend_section"):
-        eps_sum_4q = fundamentals.get("eps_sum_4q")
-        latest_eps = fundamentals.get("latest_eps")
         net_margin = fundamentals.get("net_margin")
         operating_margin = fundamentals.get("operating_margin")
-
-        def metric_level(value, excellent=None, good=None, weak=None):
-            if value is None:
-                return "未取得"
-            if excellent is not None and value >= excellent:
-                return "優"
-            if good is not None and value >= good:
-                return "良"
-            if weak is not None and value < weak:
-                return "偏弱"
-            return "普通"
-
-        eps_sum_level = metric_level(eps_sum_4q, excellent=10, good=5, weak=0)
-        latest_eps_level = metric_level(latest_eps, excellent=3, good=1, weak=0)
-        net_margin_level = metric_level(net_margin, excellent=10, good=5, weak=0)
-        operating_margin_level = metric_level(operating_margin, excellent=15, good=10, weak=0)
 
         fundamental_block = f"""
         <div class="section">
             <h3>基本面評分</h3>
             <div class="grid">
-                <div class="item"><span>近4季 EPS 合計</span><strong>{eps_sum_4q if eps_sum_4q is not None else '未取得'}</strong></div>
-                <div class="item"><span>最新單季 EPS</span><strong>{latest_eps if latest_eps is not None else '未取得'}</strong></div>
                 <div class="item"><span>單季稅後淨利率</span><strong>{str(net_margin) + '%' if net_margin is not None else '未取得'}</strong></div>
                 <div class="item"><span>單季營業利益率</span><strong>{str(operating_margin) + '%' if operating_margin is not None else '未取得'}</strong></div>
-                <div class="item wide"><span>基本面條件</span><strong>1. 近4季 EPS >= 5　2. 單季稅後淨利率 >= 5%　3. 單季營業利益率 >= 10%</strong></div>
+                <div class="item wide"><span>基本面條件</span><strong>1. 單季稅後淨利率 >= 5%　2. 單季營業利益率 >= 10%</strong></div>
                 <div class="item wide"><span>資料說明</span><strong>{fundamentals.get('source_note', '無')}</strong></div>
             </div>
-        </div>
-        <div class="section">
-            <h3>基本面判讀標準表</h3>
-            <div class="table-wrap">
-                <table class="score-table">
-                    <thead>
-                        <tr>
-                            <th>指標</th>
-                            <th>優</th>
-                            <th>良</th>
-                            <th>普通</th>
-                            <th>偏弱</th>
-                            <th>目前判讀</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <td>近4季 EPS 合計</td>
-                            <td>>= 10</td>
-                            <td>>= 5</td>
-                            <td>0 ~ 4.99</td>
-                            <td>< 0</td>
-                            <td>{eps_sum_level}</td>
-                        </tr>
-                        <tr>
-                            <td>最新單季 EPS</td>
-                            <td>>= 3</td>
-                            <td>>= 1</td>
-                            <td>0 ~ 0.99</td>
-                            <td>< 0</td>
-                            <td>{latest_eps_level}</td>
-                        </tr>
-                        <tr>
-                            <td>單季稅後淨利率</td>
-                            <td>>= 10%</td>
-                            <td>>= 5%</td>
-                            <td>0% ~ 4.99%</td>
-                            <td>< 0%</td>
-                            <td>{net_margin_level}</td>
-                        </tr>
-                        <tr>
-                            <td>單季營業利益率</td>
-                            <td>>= 15%</td>
-                            <td>>= 10%</td>
-                            <td>0% ~ 9.99%</td>
-                            <td>< 0%</td>
-                            <td>{operating_margin_level}</td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-            <ul>
-                <li>近4季 EPS 合計：看最近一年整體獲利能力。</li>
-                <li>最新單季 EPS：看最近一季獲利是否正在轉強或轉弱。</li>
-                <li>單季稅後淨利率：看公司最後真正留下多少利潤。</li>
-                <li>單季營業利益率：看公司本業獲利能力是否夠強。</li>
-            </ul>
         </div>
         """
 
@@ -1100,7 +1001,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>投資查詢平台 v10</title>
+    <title>投資查詢平台 v13</title>
     <style>
         body { margin: 0; font-family: "Microsoft JhengHei", Arial, sans-serif; background: #f5f7fb; color: #1f2937; }
         .container { max-width: 1200px; margin: 30px auto; padding: 20px; }
@@ -1142,10 +1043,10 @@ HTML_TEMPLATE = """
 <body>
     <div class="container">
         <div class="card">
-            <h1>投資查詢平台 v10</h1>
+            <h1>投資查詢平台 v13</h1>
             <div class="sub">
                 支援台股、美股、英股、台灣加權指數、匯率、原物料、債券 ETF。<br>
-                內建 KD、RSI、均線、量能、葛蘭碧八大法則、成本價分析，並新增高殖利率股建議、自動估算殖利率，以及 EPS / 淨利率 / 營業利益率基本面評分。
+                內建 KD、RSI、均線、量能、葛蘭碧八大法則、成本價分析，並新增高殖利率股建議、自動估算殖利率，以及淨利率 / 營業利益率基本面評分。
             </div>
             <form method="post">
                 <input type="text" name="query" placeholder="例如：台積電、0050、台灣加權指數、美元、黃金、美債" value="{{ query or '' }}" required>
@@ -1156,7 +1057,7 @@ HTML_TEMPLATE = """
             <div class="tips">
                 範例：台積電、0050、台灣加權指數、美元、美債、黃金、原油、銅、蘋果、匯豐。<br>
                 股票若未填殖利率，系統會嘗試依近一年股利與現價自動估算。<br>
-                若抓得到季報，也會把近4季 EPS、單季稅後淨利率、單季營業利益率納入綜合分數。
+                若抓得到季報，也會把單季稅後淨利率、單季營業利益率納入綜合分數。
             </div>
             <div class="quick-links">
                 <a href="/?q=台積電">台積電</a>
