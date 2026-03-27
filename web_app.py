@@ -352,6 +352,82 @@ def estimate_dividend_yield(symbol: str, current_price: Optional[float]) -> Opti
         return None
 
 
+def pick_first_valid_series(df: Optional[pd.DataFrame], candidates: list[str]) -> Optional[pd.Series]:
+    if df is None or getattr(df, "empty", True):
+        return None
+    for col in candidates:
+        if col in df.index:
+            s = pd.to_numeric(df.loc[col], errors="coerce").dropna()
+            if not s.empty:
+                return s
+    return None
+
+
+def get_fundamental_metrics(symbol: str, asset_type: str):
+    if asset_type not in {"stock", "us_stock", "uk_stock"}:
+        return None
+    try:
+        ticker = yf.Ticker(symbol)
+        q_income = getattr(ticker, "quarterly_income_stmt", None)
+        if q_income is None or q_income.empty:
+            return None
+
+        revenue = pick_first_valid_series(q_income, ["Total Revenue", "Operating Revenue", "Revenue"])
+        operating_income = pick_first_valid_series(q_income, ["Operating Income", "EBIT"])
+        net_income = pick_first_valid_series(q_income, ["Net Income", "Net Income Common Stockholders", "Net Income Including Noncontrolling Interests"])
+        if revenue is None or operating_income is None or net_income is None:
+            return None
+
+        cols = sorted(set(list(revenue.index) + list(operating_income.index) + list(net_income.index)), reverse=True)
+        if not cols:
+            return None
+        revenue = revenue.reindex(cols)
+        operating_income = operating_income.reindex(cols)
+        net_income = net_income.reindex(cols)
+
+        shares = None
+        try:
+            info = getattr(ticker, "info", {}) or {}
+            shares = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding")
+            if shares is not None:
+                shares = float(shares)
+                if shares <= 0:
+                    shares = None
+        except Exception:
+            shares = None
+
+        eps_sum_4q = None
+        latest_eps = None
+        if shares:
+            eps_series = (net_income / shares).dropna()
+            if len(eps_series) >= 4:
+                eps_sum_4q = float(eps_series.iloc[:4].sum())
+            if len(eps_series) >= 1:
+                latest_eps = float(eps_series.iloc[0])
+
+        latest_revenue = revenue.iloc[0] if len(revenue) >= 1 else None
+        latest_net_income = net_income.iloc[0] if len(net_income) >= 1 else None
+        latest_operating_income = operating_income.iloc[0] if len(operating_income) >= 1 else None
+
+        net_margin = None
+        operating_margin = None
+        if latest_revenue is not None and pd.notna(latest_revenue) and float(latest_revenue) != 0:
+            if latest_net_income is not None and pd.notna(latest_net_income):
+                net_margin = float(latest_net_income) / float(latest_revenue) * 100
+            if latest_operating_income is not None and pd.notna(latest_operating_income):
+                operating_margin = float(latest_operating_income) / float(latest_revenue) * 100
+
+        return {
+            "eps_sum_4q": round(eps_sum_4q, 2) if eps_sum_4q is not None else None,
+            "latest_eps": round(latest_eps, 2) if latest_eps is not None else None,
+            "net_margin": round(net_margin, 2) if net_margin is not None else None,
+            "operating_margin": round(operating_margin, 2) if operating_margin is not None else None,
+            "source_note": "以 Yahoo Finance 季報資料估算；EPS 為近4季單季 EPS 合計。",
+        }
+    except Exception:
+        return None
+
+
 def common_metrics(hist: pd.DataFrame):
     hist = hist.copy()
     hist = hist[["Open", "High", "Low", "Close", "Volume"]].dropna()
@@ -416,7 +492,7 @@ def granville_signal(m: dict):
     return {"rule": "中性", "signal": "未出現明確訊號", "score": 0, "reason": "目前價格與均線關係沒有明顯買賣訊號"}
 
 
-def score_signal(m: dict, asset_type: str):
+def score_signal(m: dict, asset_type: str, fundamentals: Optional[dict] = None):
     score = 0
     reasons = []
     risk_note = []
@@ -497,6 +573,44 @@ def score_signal(m: dict, asset_type: str):
             reasons.append("成交量大致正常")
     score += granville["score"]
     reasons.append(f"葛蘭碧判斷：{granville['reason']}")
+
+    if asset_type in {"stock", "us_stock", "uk_stock"}:
+        if fundamentals:
+            eps_sum_4q = fundamentals.get("eps_sum_4q")
+            net_margin = fundamentals.get("net_margin")
+            operating_margin = fundamentals.get("operating_margin")
+
+            if eps_sum_4q is not None:
+                if eps_sum_4q >= 5:
+                    score += 2
+                    reasons.append(f"近4季 EPS 合計 {eps_sum_4q}，達到 >= 5")
+                else:
+                    score -= 2
+                    reasons.append(f"近4季 EPS 合計 {eps_sum_4q}，未達 >= 5")
+            else:
+                reasons.append("近4季 EPS 暫時抓不到")
+
+            if net_margin is not None:
+                if net_margin >= 5:
+                    score += 1
+                    reasons.append(f"單季稅後淨利率 {net_margin}% ，達到 >= 5%")
+                else:
+                    score -= 1
+                    reasons.append(f"單季稅後淨利率 {net_margin}% ，未達 >= 5%")
+            else:
+                reasons.append("單季稅後淨利率暫時抓不到")
+
+            if operating_margin is not None:
+                if operating_margin >= 10:
+                    score += 1
+                    reasons.append(f"單季營業利益率 {operating_margin}% ，達到 >= 10%")
+                else:
+                    score -= 1
+                    reasons.append(f"單季營業利益率 {operating_margin}% ，未達 >= 10%")
+            else:
+                reasons.append("單季營業利益率暫時抓不到")
+        else:
+            reasons.append("基本面財報資料暫時抓不到，未納入 EPS / 利潤率加分")
     if close is not None and support is not None and close > 0:
         if (close - support) / close * 100 <= 3:
             risk_note.append("價格很接近近期支撐，若跌破要小心")
@@ -688,7 +802,7 @@ def create_chart_html(hist: pd.DataFrame, asset_type_label: str) -> str:
     return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
-def build_result_dict(title: str, asset_type: str, asset_type_label: str, query: str, symbol: str, hist: pd.DataFrame, m: dict, scored: dict, cost_info=None, dividend_yield: Optional[float] = None, dividend_estimated: bool = False):
+def build_result_dict(title: str, asset_type: str, asset_type_label: str, query: str, symbol: str, hist: pd.DataFrame, m: dict, scored: dict, cost_info=None, dividend_yield: Optional[float] = None, dividend_estimated: bool = False, fundamentals: Optional[dict] = None):
     digits = 4 if asset_type_label == "匯率" else 2
     yield_info = analyze_dividend_yield(dividend_yield, estimated=dividend_estimated)
     chinese_name = get_chinese_name(query, symbol, asset_type)
@@ -729,6 +843,7 @@ def build_result_dict(title: str, asset_type: str, asset_type_label: str, query:
         "yield_advice": yield_info["yield_advice"],
         "yield_source": yield_info["yield_source"],
         "show_dividend_section": asset_type in {"stock", "us_stock", "uk_stock"},
+        "fundamentals": fundamentals,
         "news_query": news_query,
         "latest_news": latest_news,
     }
@@ -750,10 +865,11 @@ def analyze_generic(symbol: str, query: str, title: str, asset_type: str, asset_
     if hist.empty or len(hist) < 70:
         return None, f"找不到 {query} 的有效{asset_label}資料。"
     m = common_metrics(hist)
-    scored = score_signal(m, asset_type)
+    fundamentals = get_fundamental_metrics(real_symbol, asset_type)
+    scored = score_signal(m, asset_type, fundamentals)
     cost_info = analyze_cost_plan(m["close"], cost, m["support"], m["resistance"], asset_type)
     final_yield, estimated = resolve_dividend_input_or_estimate(real_symbol, m["close"], dividend_yield, asset_type)
-    return build_result_dict(title, asset_type, asset_label, query, real_symbol, hist, m, scored, cost_info, final_yield, estimated), None
+    return build_result_dict(title, asset_type, asset_label, query, real_symbol, hist, m, scored, cost_info, final_yield, estimated, fundamentals), None
 
 
 def analyze_target(query: str, cost: Optional[float] = None, dividend_yield: Optional[float] = None):
@@ -809,6 +925,27 @@ def format_analysis_html(result: dict):
             </div>
         </div>
         '''
+    fundamentals = result.get("fundamentals") or {}
+    fundamental_block = ""
+    if result.get("show_dividend_section"):
+        eps_sum_4q = fundamentals.get("eps_sum_4q")
+        latest_eps = fundamentals.get("latest_eps")
+        net_margin = fundamentals.get("net_margin")
+        operating_margin = fundamentals.get("operating_margin")
+        fundamental_block = f"""
+        <div class="section">
+            <h3>基本面評分</h3>
+            <div class="grid">
+                <div class="item"><span>近4季 EPS 合計</span><strong>{eps_sum_4q if eps_sum_4q is not None else '未取得'}</strong></div>
+                <div class="item"><span>最新單季 EPS</span><strong>{latest_eps if latest_eps is not None else '未取得'}</strong></div>
+                <div class="item"><span>單季稅後淨利率</span><strong>{str(net_margin) + '%' if net_margin is not None else '未取得'}</strong></div>
+                <div class="item"><span>單季營業利益率</span><strong>{str(operating_margin) + '%' if operating_margin is not None else '未取得'}</strong></div>
+                <div class="item wide"><span>基本面條件</span><strong>1. 近4季 EPS >= 5　2. 單季稅後淨利率 >= 5%　3. 單季營業利益率 >= 10%</strong></div>
+                <div class="item wide"><span>資料說明</span><strong>{fundamentals.get('source_note', '無')}</strong></div>
+            </div>
+        </div>
+        """
+
     cost_block = ""
     cost_info = result.get("cost_info")
     if cost_info:
@@ -871,6 +1008,7 @@ def format_analysis_html(result: dict):
             <div class="item wide"><span>進場時機</span><strong>{result.get('timing')}</strong></div>
             <div class="item wide"><span>持有者動作</span><strong>{result.get('holder_action')}</strong></div>
         </div>
+        {fundamental_block}
         {dividend_block}
         <div class="section"><h3>葛蘭碧八大法則</h3><ul><li>{result.get('granville_reason')}</li></ul></div>
         <div class="section"><h3>判斷依據</h3><ul>{reasons_html}</ul></div>
@@ -928,7 +1066,7 @@ HTML_TEMPLATE = """
             <h1>投資查詢平台 v9</h1>
             <div class="sub">
                 支援台股、美股、英股、台灣加權指數、匯率、原物料、債券 ETF。<br>
-                內建 KD、RSI、均線、量能、葛蘭碧八大法則、成本價分析，並新增高殖利率股建議與自動估算殖利率。
+                內建 KD、RSI、均線、量能、葛蘭碧八大法則、成本價分析，並新增高殖利率股建議、自動估算殖利率，以及 EPS / 淨利率 / 營業利益率基本面評分。
             </div>
             <form method="post">
                 <input type="text" name="query" placeholder="例如：台積電、0050、台灣加權指數、美元、黃金、美債" value="{{ query or '' }}" required>
@@ -938,7 +1076,8 @@ HTML_TEMPLATE = """
             </form>
             <div class="tips">
                 範例：台積電、0050、台灣加權指數、美元、美債、黃金、原油、銅、蘋果、匯豐。<br>
-                股票若未填殖利率，系統會嘗試依近一年股利與現價自動估算。
+                股票若未填殖利率，系統會嘗試依近一年股利與現價自動估算。<br>
+                若抓得到季報，也會把近4季 EPS、單季稅後淨利率、單季營業利益率納入綜合分數。
             </div>
             <div class="quick-links">
                 <a href="/?q=台積電">台積電</a>
