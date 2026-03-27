@@ -3,6 +3,10 @@ import math
 import difflib
 import os
 from typing import Tuple, Optional
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+import xml.etree.ElementTree as ET
+import html
 
 import pandas as pd
 import yfinance as yf
@@ -188,6 +192,92 @@ def suggest_tw_stock_names(query: str, limit: int = 5):
     if contains_matches:
         return contains_matches
     return difflib.get_close_matches(q, TW_NAME_LIST, n=limit, cutoff=0.4)
+
+
+
+def get_chinese_name(query: str, symbol: str, asset_type: str) -> str:
+    if symbol.endswith(".TW") or symbol.endswith(".TWO"):
+        code = symbol.split(".")[0]
+        info = twstock.codes.get(code)
+        if info and getattr(info, "name", None):
+            return str(info.name).strip()
+
+    fx_name_map = {
+        "USDTWD=X": "美元兌台幣",
+        "AUDTWD=X": "澳幣兌台幣",
+        "JPYTWD=X": "日圓兌台幣",
+        "EURTWD=X": "歐元兌台幣",
+    }
+
+    index_name_map = {
+        "^TWII": "台灣加權指數",
+    }
+
+    bond_name_map = {
+        "TLT": "20年美債 ETF",
+        "IEF": "7-10年美債 ETF",
+        "SHY": "短天期美債 ETF",
+        "LQD": "投資等級債 ETF",
+        "HYG": "高收益債 ETF",
+        "BND": "總體債券 ETF",
+        "EMB": "新興市場債 ETF",
+    }
+
+    commodity_name_map = {
+        "GC=F": "黃金",
+        "SI=F": "白銀",
+        "PL=F": "白金",
+        "PA=F": "鈀金",
+        "CL=F": "紐約原油",
+        "BZ=F": "布蘭特原油",
+        "NG=F": "天然氣",
+        "HG=F": "銅",
+        "ZC=F": "玉米",
+        "ZS=F": "黃豆",
+        "ZW=F": "小麥",
+        "KC=F": "咖啡",
+        "CC=F": "可可",
+        "CT=F": "棉花",
+    }
+
+    stock_name_map = {
+        "AAPL": "蘋果",
+        "MSFT": "微軟",
+        "NVDA": "輝達",
+        "AMZN": "亞馬遜",
+        "GOOGL": "谷歌",
+        "TSLA": "特斯拉",
+        "META": "Meta",
+        "BRK-B": "波克夏",
+        "SPY": "標普500 ETF",
+        "QQQ": "那斯達克100 ETF",
+        "DIA": "道瓊 ETF",
+        "SOXX": "半導體 ETF",
+        "VTI": "美股大盤 ETF",
+        "VOO": "先鋒標普500 ETF",
+        "HSBA.L": "匯豐控股",
+        "BP.L": "英國石油",
+        "VOD.L": "沃達豐",
+        "BARC.L": "巴克萊",
+        "RR.L": "勞斯萊斯",
+        "ULVR.L": "聯合利華",
+        "AAL.L": "英美資源",
+        "AZN.L": "阿斯特捷利康",
+        "RIO.L": "力拓",
+    }
+
+    if symbol in fx_name_map:
+        return fx_name_map[symbol]
+    if symbol in index_name_map:
+        return index_name_map[symbol]
+    if symbol in bond_name_map:
+        return bond_name_map[symbol]
+    if symbol in commodity_name_map:
+        return commodity_name_map[symbol]
+    if symbol in stock_name_map:
+        return stock_name_map[symbol]
+
+    return query
 
 
 def normalize_symbol(query: str) -> str:
@@ -514,6 +604,62 @@ def analyze_cost_plan(current_price: float, cost: Optional[float], support: floa
     return {"cost": round(cost, 4), "pnl_pct": pnl_pct, "action": action, "support_note": support_note, "resistance_note": resistance_note, "stop_loss_pct": stop_loss_pct, "take_profit_pct": take_profit_pct}
 
 
+def build_news_search_term(query: str, chinese_name: str, symbol: str, asset_type_label: str) -> str:
+    base = (chinese_name or query or symbol).strip()
+    suffix_map = {
+        "股票": "股票 財經",
+        "美股": "美股 財經",
+        "英股": "英股 財經",
+        "匯率": "匯率 財經",
+        "債券": "債券 財經",
+        "指數": "指數 財經",
+        "原物料": "原物料 財經",
+    }
+    suffix = suffix_map.get(asset_type_label, "財經")
+    return f"{base} {suffix}".strip()
+
+
+def fetch_latest_chinese_news(query: str, limit: int = 5):
+    if not query:
+        return []
+    url = f"https://news.google.com/rss/search?q={quote(query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    }
+    try:
+        req = Request(url, headers=headers)
+        with urlopen(req, timeout=10) as resp:
+            raw = resp.read()
+        root = ET.fromstring(raw)
+    except Exception:
+        return []
+
+    items = []
+    seen = set()
+    for item in root.findall('.//item'):
+        title = (item.findtext('title') or '').strip()
+        link = (item.findtext('link') or '').strip()
+        pub_date = (item.findtext('pubDate') or '').strip()
+        source_node = item.find('source')
+        source = (source_node.text or '').strip() if source_node is not None and source_node.text else 'Google 新聞'
+        if not title or not link:
+            continue
+        key = (title, link)
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append({
+            "title": html.escape(title),
+            "link": html.escape(link, quote=True),
+            "source": html.escape(source),
+            "pub_date": html.escape(pub_date),
+        })
+        if len(items) >= limit:
+            break
+    return items
+
+
 def create_chart_html(hist: pd.DataFrame, asset_type_label: str) -> str:
     df = hist.copy().dropna()
     if df.empty:
@@ -545,17 +691,46 @@ def create_chart_html(hist: pd.DataFrame, asset_type_label: str) -> str:
 def build_result_dict(title: str, asset_type: str, asset_type_label: str, query: str, symbol: str, hist: pd.DataFrame, m: dict, scored: dict, cost_info=None, dividend_yield: Optional[float] = None, dividend_estimated: bool = False):
     digits = 4 if asset_type_label == "匯率" else 2
     yield_info = analyze_dividend_yield(dividend_yield, estimated=dividend_estimated)
+    chinese_name = get_chinese_name(query, symbol, asset_type)
+    news_query = build_news_search_term(query, chinese_name, symbol, asset_type_label)
+    latest_news = fetch_latest_chinese_news(news_query, limit=5)
     return {
-        "title": f"{title}｜{query}", "asset_type": asset_type_label, "symbol": symbol,
-        "close": safe_float(m["close"], digits), "sma5": safe_float(m["sma5"], digits), "sma20": safe_float(m["sma20"], digits), "sma60": safe_float(m["sma60"], digits),
-        "rsi14": safe_float(m["rsi14"], 1), "k": safe_float(m["k"], 1), "d": safe_float(m["d"], 1),
-        "last_volume": safe_float(m["last_volume"], 0), "vol_ma20": safe_float(m["vol_ma20"], 0), "vol20": safe_float(m["vol20"], 1),
-        "support": safe_float(m["support"], digits), "resistance": safe_float(m["resistance"], digits),
-        "score": scored["score"], "signal": scored["signal"], "action": scored["action"], "timing": scored.get("timing"), "holder_action": scored.get("holder_action"),
-        "reasons": scored["reasons"], "risk_note": scored["risk_note"], "granville_rule": scored.get("granville_rule"), "granville_signal": scored.get("granville_signal"), "granville_reason": scored.get("granville_reason"),
-        "cost_info": cost_info, "chart_html": create_chart_html(hist, asset_type_label),
-        "dividend_yield": dividend_yield, "is_high_yield": yield_info["is_high_yield"], "yield_level": yield_info["yield_level"], "yield_advice": yield_info["yield_advice"], "yield_source": yield_info["yield_source"],
+        "title": f"{title}｜{query}",
+        "asset_type": asset_type_label,
+        "symbol": symbol,
+        "chinese_name": chinese_name,
+        "close": safe_float(m["close"], digits),
+        "sma5": safe_float(m["sma5"], digits),
+        "sma20": safe_float(m["sma20"], digits),
+        "sma60": safe_float(m["sma60"], digits),
+        "rsi14": safe_float(m["rsi14"], 1),
+        "k": safe_float(m["k"], 1),
+        "d": safe_float(m["d"], 1),
+        "last_volume": safe_float(m["last_volume"], 0),
+        "vol_ma20": safe_float(m["vol_ma20"], 0),
+        "vol20": safe_float(m["vol20"], 1),
+        "support": safe_float(m["support"], digits),
+        "resistance": safe_float(m["resistance"], digits),
+        "score": scored["score"],
+        "signal": scored["signal"],
+        "action": scored["action"],
+        "timing": scored.get("timing"),
+        "holder_action": scored.get("holder_action"),
+        "reasons": scored["reasons"],
+        "risk_note": scored["risk_note"],
+        "granville_rule": scored.get("granville_rule"),
+        "granville_signal": scored.get("granville_signal"),
+        "granville_reason": scored.get("granville_reason"),
+        "cost_info": cost_info,
+        "chart_html": create_chart_html(hist, asset_type_label),
+        "dividend_yield": dividend_yield,
+        "is_high_yield": yield_info["is_high_yield"],
+        "yield_level": yield_info["yield_level"],
+        "yield_advice": yield_info["yield_advice"],
+        "yield_source": yield_info["yield_source"],
         "show_dividend_section": asset_type in {"stock", "us_stock", "uk_stock"},
+        "news_query": news_query,
+        "latest_news": latest_news,
     }
 
 
@@ -651,6 +826,22 @@ def format_analysis_html(result: dict):
             </div>
         </div>
         '''
+    news_items = result.get("latest_news", []) or []
+    if news_items:
+        news_html = "".join(
+            f'<li><a href="{n["link"]}" target="_blank" rel="noopener noreferrer">{n["title"]}</a><div class="news-meta">{n["source"]}｜{n["pub_date"]}</div></li>'
+            for n in news_items
+        )
+    else:
+        news_html = '<li>目前抓不到相關中文新聞，請稍後再試。</li>'
+    news_block = f'''
+        <div class="section">
+            <h3>最新五篇中文新聞</h3>
+            <div class="news-hint">搜尋關鍵字：{result.get('news_query')}</div>
+            <ul class="news-list">{news_html}</ul>
+        </div>
+    '''
+
     return f'''
     <div class="result-card">
         <div class="result-head">
@@ -659,6 +850,7 @@ def format_analysis_html(result: dict):
         </div>
         <div class="grid">
             <div class="item"><span>查詢代碼</span><strong>{result.get('symbol')}</strong></div>
+            <div class="item"><span>標的中文名稱</span><strong>{result.get('chinese_name')}</strong></div>
             <div class="item"><span>資產類型</span><strong>{result.get('asset_type')}</strong></div>
             <div class="item"><span>現價</span><strong>{result.get('close')}</strong></div>
             <div class="item"><span>5MA</span><strong>{result.get('sma5')}</strong></div>
@@ -684,6 +876,7 @@ def format_analysis_html(result: dict):
         <div class="section"><h3>判斷依據</h3><ul>{reasons_html}</ul></div>
         <div class="section"><h3>風險提醒</h3><ul>{risks_html if risks_html else '<li>無</li>'}</ul></div>
         {cost_block}
+        {news_block}
         <div class="section"><h3>技術圖表</h3>{result.get('chart_html', '')}</div>
     </div>
     '''
@@ -695,7 +888,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>投資查詢平台 v7</title>
+    <title>投資查詢平台 v9</title>
     <style>
         body { margin: 0; font-family: "Microsoft JhengHei", Arial, sans-serif; background: #f5f7fb; color: #1f2937; }
         .container { max-width: 1200px; margin: 30px auto; padding: 20px; }
@@ -732,7 +925,7 @@ HTML_TEMPLATE = """
 <body>
     <div class="container">
         <div class="card">
-            <h1>投資查詢平台 v7</h1>
+            <h1>投資查詢平台 v9</h1>
             <div class="sub">
                 支援台股、美股、英股、台灣加權指數、匯率、原物料、債券 ETF。<br>
                 內建 KD、RSI、均線、量能、葛蘭碧八大法則、成本價分析，並新增高殖利率股建議與自動估算殖利率。
