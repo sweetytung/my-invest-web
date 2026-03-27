@@ -463,21 +463,21 @@ def granville_signal(m: dict):
     crossed_down = prev_close >= prev_sma20 and close < sma20
     deviation_pct = ((close - sma20) / sma20) * 100 if sma20 != 0 else 0
     if ma_up and crossed_up:
-        return {"rule": "買1", "signal": "偏多訊號", "score": 2, "reason": "均線往上，價格剛站回均線上方"}
+        return {"rule": "B1", "signal": "偏多訊號", "score": 2, "reason": "均線往上，價格剛站回均線上方"}
     if ma_up and close < sma20 and deviation_pct <= -5:
-        return {"rule": "買2", "signal": "回檔觀察", "score": 1, "reason": "均線往上，但價格拉回較多，留意止穩"}
+        return {"rule": "B2", "signal": "回檔觀察", "score": 1, "reason": "均線往上，但價格拉回較多，留意止穩"}
     if ma_up and close > sma20 and 0 <= deviation_pct <= 3:
-        return {"rule": "買3", "signal": "偏多延續", "score": 1, "reason": "均線往上，價格貼近均線上方整理"}
+        return {"rule": "B3", "signal": "偏多延續", "score": 1, "reason": "均線往上，價格貼近均線上方整理"}
     if ma_down and deviation_pct <= -8:
-        return {"rule": "買4", "signal": "跌深反彈留意", "score": 1, "reason": "價格離均線太遠，可能有技術反彈"}
+        return {"rule": "B4", "signal": "跌深反彈留意", "score": 1, "reason": "價格離均線太遠，可能有技術反彈"}
     if ma_down and crossed_down:
-        return {"rule": "賣1", "signal": "偏弱訊號", "score": -2, "reason": "均線往下，價格剛跌破均線"}
+        return {"rule": "S1", "signal": "偏弱訊號", "score": -2, "reason": "均線往下，價格剛跌破均線"}
     if ma_down and close > sma20 and deviation_pct >= 5:
-        return {"rule": "賣2", "signal": "反彈過大", "score": -1, "reason": "均線往下，價格反彈太多，追價風險高"}
+        return {"rule": "S2", "signal": "反彈過大", "score": -1, "reason": "均線往下，價格反彈太多，追價風險高"}
     if ma_down and close < sma20 and -3 <= deviation_pct <= 0:
-        return {"rule": "賣3", "signal": "弱勢整理", "score": -1, "reason": "均線往下，價格靠近均線但仍偏弱"}
+        return {"rule": "S3", "signal": "弱勢整理", "score": -1, "reason": "均線往下，價格靠近均線但仍偏弱"}
     if ma_up and deviation_pct >= 8:
-        return {"rule": "賣4", "signal": "漲多留意拉回", "score": -1, "reason": "價格離均線太遠，短線可能拉回"}
+        return {"rule": "S4", "signal": "漲多留意拉回", "score": -1, "reason": "價格離均線太遠，短線可能拉回"}
     return {"rule": "中性", "signal": "未出現明確訊號", "score": 0, "reason": "目前價格與均線關係沒有明顯買賣訊號"}
 
 
@@ -752,6 +752,56 @@ def fetch_latest_chinese_news(query: str, limit: int = 5):
     return items
 
 
+
+
+def granville_signal_from_values(close_now, close_prev, sma20_now, sma20_prev):
+    if None in [close_now, close_prev, sma20_now, sma20_prev]:
+        return None
+    if pd.isna(close_now) or pd.isna(close_prev) or pd.isna(sma20_now) or pd.isna(sma20_prev):
+        return None
+    ma_up = sma20_now > sma20_prev
+    ma_down = sma20_now < sma20_prev
+    crossed_up = close_prev <= sma20_prev and close_now > sma20_now
+    crossed_down = close_prev >= sma20_prev and close_now < sma20_now
+    deviation_pct = ((close_now - sma20_now) / sma20_now) * 100 if sma20_now != 0 else 0
+
+    if ma_up and crossed_up:
+        return {"rule": "B1", "side": "buy", "signal": "偏多訊號", "reason": "均線往上，價格剛站回均線上方"}
+    if ma_up and close_now < sma20_now and deviation_pct <= -5:
+        return {"rule": "B2", "side": "buy", "signal": "回檔觀察", "reason": "均線往上，但價格拉回較多，留意止穩"}
+    if ma_up and close_now > sma20_now and 0 <= deviation_pct <= 3:
+        return {"rule": "B3", "side": "buy", "signal": "偏多延續", "reason": "均線往上，價格貼近均線上方整理"}
+    if ma_down and deviation_pct <= -8:
+        return {"rule": "B4", "side": "buy", "signal": "跌深反彈留意", "reason": "價格離均線太遠，可能有技術反彈"}
+    if ma_down and crossed_down:
+        return {"rule": "S1", "side": "sell", "signal": "偏弱訊號", "reason": "均線往下，價格剛跌破均線"}
+    if ma_down and close_now > sma20_now and deviation_pct >= 5:
+        return {"rule": "S2", "side": "sell", "signal": "反彈過大", "reason": "均線往下，價格反彈太多，追價風險高"}
+    if ma_down and close_now < sma20_now and -3 <= deviation_pct <= 0:
+        return {"rule": "S3", "side": "sell", "signal": "弱勢整理", "reason": "均線往下，價格靠近均線但仍偏弱"}
+    if ma_up and deviation_pct >= 8:
+        return {"rule": "S4", "side": "sell", "signal": "漲多留意拉回", "reason": "價格離均線太遠，短線可能拉回"}
+    return None
+
+
+def detect_granville_points(hist: pd.DataFrame, lookback: int = 180):
+    df = hist.copy().dropna().tail(max(lookback, 80))
+    if df.empty or len(df) < 25:
+        return []
+    close = df["Close"]
+    sma20 = close.rolling(20).mean()
+    points = []
+    for i in range(1, len(df)):
+        signal = granville_signal_from_values(close.iloc[i], close.iloc[i-1], sma20.iloc[i], sma20.iloc[i-1])
+        if not signal:
+            continue
+        point = dict(signal)
+        point["date"] = df.index[i]
+        point["price"] = float(close.iloc[i])
+        points.append(point)
+    return points
+
+
 def create_chart_html(hist: pd.DataFrame, asset_type_label: str) -> str:
     df = hist.copy().dropna()
     if df.empty:
@@ -763,11 +813,52 @@ def create_chart_html(hist: pd.DataFrame, asset_type_label: str) -> str:
     sma60 = close.rolling(60).mean()
     rsi14 = calc_rsi(close, 14)
     k, d = calc_kd(df, 9, 3, 3)
-    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.5, 0.15, 0.17, 0.18], subplot_titles=("K線圖", "成交量", "RSI", "KD"))
+    granville_points = detect_granville_points(df, lookback=180)
+
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+        row_heights=[0.5, 0.15, 0.17, 0.18],
+        subplot_titles=("K線圖（含葛蘭碧買賣點）", "成交量", "RSI", "KD")
+    )
     fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="K線"), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=sma5, mode="lines", name="5MA"), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=sma20, mode="lines", name="20MA"), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=sma60, mode="lines", name="60MA"), row=1, col=1)
+
+    buy_points = [p for p in granville_points if p["side"] == "buy"]
+    sell_points = [p for p in granville_points if p["side"] == "sell"]
+
+    if buy_points:
+        fig.add_trace(
+            go.Scatter(
+                x=[p["date"] for p in buy_points],
+                y=[p["price"] for p in buy_points],
+                mode="markers+text",
+                name="葛蘭碧買點",
+                text=[p["rule"] for p in buy_points],
+                textposition="top center",
+                marker=dict(symbol="triangle-up", size=12, color="#16a34a"),
+                customdata=[[p["signal"], p["reason"]] for p in buy_points],
+                hovertemplate="日期：%{x|%Y-%m-%d}<br>價位：%{y:.2f}<br>訊號：%{text}<br>狀態：%{customdata[0]}<br>說明：%{customdata[1]}<extra></extra>",
+            ),
+            row=1, col=1
+        )
+    if sell_points:
+        fig.add_trace(
+            go.Scatter(
+                x=[p["date"] for p in sell_points],
+                y=[p["price"] for p in sell_points],
+                mode="markers+text",
+                name="葛蘭碧賣點",
+                text=[p["rule"] for p in sell_points],
+                textposition="bottom center",
+                marker=dict(symbol="triangle-down", size=12, color="#dc2626"),
+                customdata=[[p["signal"], p["reason"]] for p in sell_points],
+                hovertemplate="日期：%{x|%Y-%m-%d}<br>價位：%{y:.2f}<br>訊號：%{text}<br>狀態：%{customdata[0]}<br>說明：%{customdata[1]}<extra></extra>",
+            ),
+            row=1, col=1
+        )
+
     fig.add_trace(go.Bar(x=df.index, y=volume, name="成交量"), row=2, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=rsi14, mode="lines", name="RSI"), row=3, col=1)
     fig.add_hline(y=70, row=3, col=1)
@@ -776,7 +867,14 @@ def create_chart_html(hist: pd.DataFrame, asset_type_label: str) -> str:
     fig.add_trace(go.Scatter(x=df.index, y=d, mode="lines", name="D"), row=4, col=1)
     fig.add_hline(y=80, row=4, col=1)
     fig.add_hline(y=20, row=4, col=1)
-    fig.update_layout(height=950, xaxis_rangeslider_visible=False, margin=dict(l=20, r=20, t=50, b=20), legend=dict(orientation="h"), template="plotly_white", title=f"{asset_type_label} 技術圖表")
+    fig.update_layout(
+        height=980,
+        xaxis_rangeslider_visible=False,
+        margin=dict(l=20, r=20, t=50, b=20),
+        legend=dict(orientation="h"),
+        template="plotly_white",
+        title=f"{asset_type_label} 技術圖表",
+    )
     return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
@@ -813,6 +911,7 @@ def build_result_dict(title: str, asset_type: str, asset_type_label: str, query:
         "granville_rule": scored.get("granville_rule"),
         "granville_signal": scored.get("granville_signal"),
         "granville_reason": scored.get("granville_reason"),
+        "granville_points": detect_granville_points(hist, lookback=180),
         "cost_info": cost_info,
         "chart_html": create_chart_html(hist, asset_type_label),
         "dividend_yield": dividend_yield,
@@ -921,6 +1020,41 @@ def format_analysis_html(result: dict):
         </div>
         """
 
+
+    granville_points = result.get("granville_points", []) or []
+    recent_points = list(reversed(granville_points[-5:]))
+    if recent_points:
+        recent_rows = "".join(
+            f"<tr><td>{p['date'].strftime('%Y-%m-%d')}</td><td>{p['rule']}</td><td>{round(p['price'], 2)}</td><td>{p['signal']}</td><td>{p['reason']}</td></tr>"
+            for p in recent_points
+        )
+        latest_point = recent_points[0]
+        granville_recent_block = f"""
+        <div class="section">
+            <h3>葛蘭碧買賣點標記</h3>
+            <div class="grid">
+                <div class="item"><span>最近訊號日期</span><strong>{latest_point['date'].strftime('%Y-%m-%d')}</strong></div>
+                <div class="item"><span>最近訊號代號</span><strong>{latest_point['rule']}</strong></div>
+                <div class="item"><span>最近訊號價位</span><strong>{round(latest_point['price'], 2)}</strong></div>
+                <div class="item"><span>最近訊號狀態</span><strong>{latest_point['signal']}</strong></div>
+                <div class="item wide"><span>最近訊號說明</span><strong>{latest_point['reason']}</strong></div>
+            </div>
+            <div class="table-wrap" style="margin-top:12px;">
+                <table class="score-table">
+                    <thead><tr><th>日期</th><th>代號</th><th>價位</th><th>狀態</th><th>說明</th></tr></thead>
+                    <tbody>{recent_rows}</tbody>
+                </table>
+            </div>
+        </div>
+        """
+    else:
+        granville_recent_block = """
+        <div class="section">
+            <h3>葛蘭碧買賣點標記</h3>
+            <ul><li>近 180 個交易日尚未偵測到明確的葛蘭碧買賣點。</li></ul>
+        </div>
+        """
+
     cost_block = ""
     cost_info = result.get("cost_info")
     if cost_info:
@@ -985,6 +1119,7 @@ def format_analysis_html(result: dict):
         </div>
         {fundamental_block}
         {dividend_block}
+        {granville_recent_block}
         <div class="section"><h3>葛蘭碧八大法則</h3><ul><li>{result.get('granville_reason')}</li></ul></div>
         <div class="section"><h3>判斷依據</h3><ul>{reasons_html}</ul></div>
         <div class="section"><h3>風險提醒</h3><ul>{risks_html if risks_html else '<li>無</li>'}</ul></div>
@@ -1001,7 +1136,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>投資查詢平台 v13</title>
+    <title>投資查詢平台 v14</title>
     <style>
         body { margin: 0; font-family: "Microsoft JhengHei", Arial, sans-serif; background: #f5f7fb; color: #1f2937; }
         .container { max-width: 1200px; margin: 30px auto; padding: 20px; }
@@ -1043,7 +1178,7 @@ HTML_TEMPLATE = """
 <body>
     <div class="container">
         <div class="card">
-            <h1>投資查詢平台 v13</h1>
+            <h1>投資查詢平台 v14</h1>
             <div class="sub">
                 支援台股、美股、英股、台灣加權指數、匯率、原物料、債券 ETF。<br>
                 內建 KD、RSI、均線、量能、葛蘭碧八大法則、成本價分析，並新增高殖利率股建議、自動估算殖利率，以及淨利率 / 營業利益率基本面評分。
