@@ -1759,9 +1759,21 @@ def analyze_generic(symbol: str, query: str, title: str, asset_type: str, asset_
     return build_result_dict(title, asset_type, asset_label, query, real_symbol, hist, m, scored, cost_info, final_yield, estimated, fundamentals, budget=budget, chart_mode=chart_mode, selected_indicators=selected_indicators), None
 
 
-def analyze_target(query: str, market_scope: str = "auto", cost: Optional[float] = None, dividend_yield: Optional[float] = None, budget: Optional[float] = None, chart_mode: str = "combo", selected_indicators: Optional[list[str]] = None):
+def analyze_target(
+    query: str,
+    market_scope: str = "auto",
+    cost: Optional[float] = None,
+    dividend_yield: Optional[float] = None,
+    budget: Optional[float] = None,
+    chart_mode: str = "combo",
+    selected_indicators: Optional[list[str]] = None
+):
+    if selected_indicators is None:
+        selected_indicators = []
+
     symbol = normalize_symbol(query, market_scope=market_scope)
     asset_type = detect_asset_type(query, symbol, market_scope=market_scope)
+
     if asset_type == "index":
         return analyze_generic(symbol, query, "指數技術分析", "index", "指數", cost, dividend_yield, budget, chart_mode, selected_indicators)
     if asset_type == "fx":
@@ -1774,14 +1786,18 @@ def analyze_target(query: str, market_scope: str = "auto", cost: Optional[float]
         return analyze_generic(symbol, query, "美股技術分析", "us_stock", "美股", cost, dividend_yield, budget, chart_mode, selected_indicators)
     if asset_type == "uk_stock":
         return analyze_generic(symbol, query, "英股技術分析", "uk_stock", "英股", cost, dividend_yield, budget, chart_mode, selected_indicators)
+
     resolved = resolve_tw_stock_symbol(query)
     if resolved:
         return analyze_generic(resolved["symbol"], query, "股票實戰策略", "stock", "股票", cost, dividend_yield, budget, chart_mode, selected_indicators)
+
     if query.strip().isdigit():
         return analyze_generic(symbol, query, "股票實戰策略", "stock", "股票", cost, dividend_yield, budget, chart_mode, selected_indicators)
+
     suggestions = suggest_tw_stock_names(query, limit=5)
     if suggestions:
         return None, "找不到對應標的，你是不是想查：<br>" + "<br>".join(f"• {x}" for x in suggestions)
+
     return None, f"找不到「{query}」對應的股票、匯率、指數、原物料或債券資料。"
 
 
