@@ -2,12 +2,21 @@ from flask import Flask, request, render_template_string
 import math
 import difflib
 import os
+import io
+import re
+from datetime import date, datetime, timedelta
 from typing import Tuple, Optional
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 import html
+import json
+import time
+from collections import OrderedDict
+from pathlib import Path
+import threading
 
+import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -60,6 +69,181 @@ TW_NAME_MAP = {}
 TW_CODE_MAP = {}
 TW_ALIAS_MAP = {}
 TW_NAME_LIST = []
+
+BASE_DIR = Path(__file__).resolve().parent
+ASSET_NAME_MAP_FILE = BASE_DIR / "asset_name_map.json"
+DEFAULT_ASSET_NAME_MAP = {
+    "USDTWD=X": "美元兌台幣", "AUDTWD=X": "澳幣兌台幣", "JPYTWD=X": "日圓兌台幣", "EURTWD=X": "歐元兌台幣",
+    "^TWII": "台灣加權指數",
+    "TLT": "20年美債 ETF", "IEF": "7-10年美債 ETF", "SHY": "短天期美債 ETF", "LQD": "投資等級債 ETF",
+    "HYG": "高收益債 ETF", "BND": "總體債券 ETF", "EMB": "新興市場債 ETF",
+    "GC=F": "黃金", "SI=F": "白銀", "PL=F": "白金", "PA=F": "鈀金", "CL=F": "紐約原油",
+    "BZ=F": "布蘭特原油", "NG=F": "天然氣", "HG=F": "銅", "ZC=F": "玉米", "ZS=F": "黃豆",
+    "ZW=F": "小麥", "KC=F": "咖啡", "CC=F": "可可", "CT=F": "棉花",
+    "AAPL": "蘋果", "MSFT": "微軟", "NVDA": "輝達", "AMZN": "亞馬遜", "GOOGL": "谷歌", "TSLA": "特斯拉",
+    "META": "Meta", "BRK-B": "波克夏", "SPY": "標普500 ETF", "QQQ": "那斯達克100 ETF", "DIA": "道瓊 ETF",
+    "SOXX": "半導體 ETF", "VTI": "美股大盤 ETF", "VOO": "先鋒標普500 ETF", "HSBA.L": "匯豐控股",
+    "BP.L": "英國石油", "VOD.L": "沃達豐", "BARC.L": "巴克萊", "RR.L": "勞斯萊斯", "ULVR.L": "聯合利華",
+    "AAL.L": "英美資源", "AZN.L": "阿斯特捷利康", "RIO.L": "力拓"
+}
+HTTP_DEFAULT_TIMEOUT = 12
+HTTP_RETRIES = max(1, int(os.environ.get("HTTP_RETRIES", "3")))
+HTTP_RETRY_SLEEP = float(os.environ.get("HTTP_RETRY_SLEEP", "0.8"))
+CACHE_MAXSIZE = max(256, int(os.environ.get("CACHE_MAXSIZE", "1024")))
+CACHE_CLEANUP_INTERVAL = max(10, int(os.environ.get("CACHE_CLEANUP_INTERVAL", "60")))
+YF_TICKER_CACHE_TTL_SECONDS = max(300, int(os.environ.get("YF_TICKER_CACHE_TTL_SECONDS", "3600")))
+YF_HISTORY_CACHE_TTL_SECONDS = max(120, int(os.environ.get("YF_HISTORY_CACHE_TTL_SECONDS", "900")))
+YF_INFO_CACHE_TTL_SECONDS = max(300, int(os.environ.get("YF_INFO_CACHE_TTL_SECONDS", "3600")))
+YF_DIVIDEND_CACHE_TTL_SECONDS = max(300, int(os.environ.get("YF_DIVIDEND_CACHE_TTL_SECONDS", "3600")))
+API_CACHE_TTL_SECONDS = max(300, int(os.environ.get("API_CACHE_TTL_SECONDS", "3600")))
+TW_OFFICIAL_CACHE_TTL_SECONDS = max(300, int(os.environ.get("TW_OFFICIAL_CACHE_TTL_SECONDS", "3600")))
+NEWS_CACHE_TTL_SECONDS = max(300, int(os.environ.get("NEWS_CACHE_TTL_SECONDS", "1800")))
+NEGATIVE_CACHE_TTL_SECONDS = max(60, int(os.environ.get("NEGATIVE_CACHE_TTL_SECONDS", "180")))
+KD_METHOD_DEFAULT = (os.environ.get("KD_METHOD", "tw") or "tw").strip().lower()
+
+_MISSING = object()
+
+
+class TTLCacheStore:
+    def __init__(self, maxsize: int = 256, cleanup_interval: int = 60):
+        self.maxsize = maxsize
+        self.cleanup_interval = cleanup_interval
+        self.data = OrderedDict()
+        self.lock = threading.RLock()
+        self.inflight = {}
+        self.op_count = 0
+
+    def _bump_ops(self):
+        self.op_count += 1
+        if self.op_count >= self.cleanup_interval:
+            self.op_count = 0
+            self.purge_expired(limit=max(32, self.maxsize // 4))
+
+    def get(self, key, default=None):
+        with self.lock:
+            item = self.data.get(key)
+            if item is None:
+                self._bump_ops()
+                return default
+            expires_at, value = item
+            if expires_at < time.time():
+                self.data.pop(key, None)
+                self._bump_ops()
+                return default
+            self.data.move_to_end(key)
+            self._bump_ops()
+            return value
+
+    def set(self, key, value, ttl_seconds: int):
+        with self.lock:
+            self.data[key] = (time.time() + ttl_seconds, value)
+            self.data.move_to_end(key)
+            while len(self.data) > self.maxsize:
+                self.data.popitem(last=False)
+            self._bump_ops()
+
+    def purge_expired(self, limit: Optional[int] = None):
+        now = time.time()
+        removed = 0
+        with self.lock:
+            for cache_key in list(self.data.keys()):
+                item = self.data.get(cache_key)
+                if item is None:
+                    continue
+                expires_at, _ = item
+                if expires_at < now:
+                    self.data.pop(cache_key, None)
+                    removed += 1
+                    if limit and removed >= limit:
+                        break
+        return removed
+
+    def get_or_compute(self, key, ttl_seconds: int, func, cache_none: bool = False, none_ttl_seconds: Optional[int] = None):
+        cached = self.get(key, default=_MISSING)
+        if cached is not _MISSING:
+            return cached
+        with self.lock:
+            cached = self.get(key, default=_MISSING)
+            if cached is not _MISSING:
+                return cached
+            event = self.inflight.get(key)
+            if event is None:
+                event = threading.Event()
+                self.inflight[key] = event
+                is_owner = True
+            else:
+                is_owner = False
+        if is_owner:
+            try:
+                value = func()
+                if value is None and not cache_none:
+                    return None
+                effective_ttl = ttl_seconds if value is not None else (none_ttl_seconds or min(ttl_seconds, NEGATIVE_CACHE_TTL_SECONDS))
+                self.set(key, value, effective_ttl)
+                return value
+            finally:
+                with self.lock:
+                    owner_event = self.inflight.pop(key, None)
+                    if owner_event is not None:
+                        owner_event.set()
+        event.wait(timeout=max(5, min(ttl_seconds, 30)))
+        return self.get(key, default=None)
+
+
+GLOBAL_TTL_CACHE = TTLCacheStore(maxsize=CACHE_MAXSIZE, cleanup_interval=CACHE_CLEANUP_INTERVAL)
+
+
+def cached_call(cache_key, ttl_seconds: int, func, cache_none: bool = False, none_ttl_seconds: Optional[int] = None):
+    return GLOBAL_TTL_CACHE.get_or_compute(cache_key, ttl_seconds, func, cache_none=cache_none, none_ttl_seconds=none_ttl_seconds)
+
+
+def load_asset_name_map():
+    if ASSET_NAME_MAP_FILE.exists():
+        try:
+            data = json.loads(ASSET_NAME_MAP_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                merged = DEFAULT_ASSET_NAME_MAP.copy()
+                merged.update({str(k): str(v) for k, v in data.items()})
+                return merged
+        except Exception as e:
+            print(f"[Warning] 讀取 asset_name_map.json 失敗：{e}")
+    try:
+        ASSET_NAME_MAP_FILE.write_text(json.dumps(DEFAULT_ASSET_NAME_MAP, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return DEFAULT_ASSET_NAME_MAP.copy()
+
+
+ASSET_NAME_MAP = load_asset_name_map()
+
+
+def startup_env_warnings():
+    if not os.environ.get("FMP_API_KEY", "").strip():
+        print("[Warning] FMP_API_KEY 未設定，將跳過 FMP 基本面資料來源。")
+    if not os.environ.get("ALPHAVANTAGE_API_KEY", "").strip():
+        print("[Warning] ALPHAVANTAGE_API_KEY 未設定，將跳過 Alpha Vantage 基本面資料來源。")
+
+
+startup_env_warnings()
+
+
+def get_cache_diagnostics():
+    with GLOBAL_TTL_CACHE.lock:
+        total_items = len(GLOBAL_TTL_CACHE.data)
+        inflight_items = len(GLOBAL_TTL_CACHE.inflight)
+    return {
+        "cache_maxsize": CACHE_MAXSIZE,
+        "cache_items": total_items,
+        "cache_inflight": inflight_items,
+        "yf_ticker_ttl": YF_TICKER_CACHE_TTL_SECONDS,
+        "yf_history_ttl": YF_HISTORY_CACHE_TTL_SECONDS,
+        "yf_info_ttl": YF_INFO_CACHE_TTL_SECONDS,
+        "yf_dividend_ttl": YF_DIVIDEND_CACHE_TTL_SECONDS,
+        "api_ttl": API_CACHE_TTL_SECONDS,
+        "tw_official_ttl": TW_OFFICIAL_CACHE_TTL_SECONDS,
+        "news_ttl": NEWS_CACHE_TTL_SECONDS,
+        "negative_ttl": NEGATIVE_CACHE_TTL_SECONDS,
+    }
 
 
 def normalize_name_text(text: str) -> str:
@@ -145,14 +329,29 @@ def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-def calc_kd(hist: pd.DataFrame, period: int = 9, k_smooth: int = 3, d_smooth: int = 3):
+def calc_kd(hist: pd.DataFrame, period: int = 9, k_smooth: int = 3, d_smooth: int = 3, method: str = KD_METHOD_DEFAULT):
     low_min = hist["Low"].rolling(window=period, min_periods=period).min()
     high_max = hist["High"].rolling(window=period, min_periods=period).max()
     spread = (high_max - low_min).replace(0, pd.NA)
-    rsv = ((hist["Close"] - low_min) / spread) * 100
-    k = rsv.ewm(alpha=1 / k_smooth, adjust=False).mean()
-    d = k.ewm(alpha=1 / d_smooth, adjust=False).mean()
-    return k, d
+    rsv = (((hist["Close"] - low_min) / spread) * 100).astype(float)
+    method = (method or KD_METHOD_DEFAULT).strip().lower()
+    if method in {"ewm", "ema", "exp"}:
+        k = rsv.ewm(alpha=1 / k_smooth, adjust=False).mean()
+        d = k.ewm(alpha=1 / d_smooth, adjust=False).mean()
+        return k, d
+    k_vals, d_vals = [], []
+    prev_k = 50.0
+    prev_d = 50.0
+    for val in rsv.tolist():
+        if pd.isna(val):
+            k_vals.append(np.nan)
+            d_vals.append(np.nan)
+            continue
+        prev_k = (prev_k * (k_smooth - 1) + float(val)) / k_smooth
+        prev_d = (prev_d * (d_smooth - 1) + prev_k) / d_smooth
+        k_vals.append(prev_k)
+        d_vals.append(prev_d)
+    return pd.Series(k_vals, index=hist.index), pd.Series(d_vals, index=hist.index)
 
 
 def calc_bollinger(close: pd.Series, window: int = 20, num_std: float = 2.0):
@@ -175,6 +374,306 @@ def calc_atr(hist: pd.DataFrame, period: int = 14):
         (low - prev_close).abs(),
     ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
+
+
+def calc_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    hist = macd - signal_line
+    return macd, signal_line, hist
+
+
+def fetch_json(url: str, timeout: int = HTTP_DEFAULT_TIMEOUT, headers: Optional[dict] = None, retries: int = HTTP_RETRIES, cache_ttl: int = API_CACHE_TTL_SECONDS):
+    cache_key = ("json", url, timeout, tuple(sorted((headers or {}).items())))
+    final_headers = headers or {"User-Agent": "Mozilla/5.0"}
+
+    def _loader():
+        for attempt in range(max(1, retries)):
+            try:
+                resp = requests.get(url, timeout=timeout, headers=final_headers)
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, dict) and (data.get("Note") or data.get("Information")):
+                    return None
+                return data
+            except Exception:
+                if attempt >= max(1, retries) - 1:
+                    return None
+                time.sleep(HTTP_RETRY_SLEEP * (attempt + 1))
+        return None
+
+    return GLOBAL_TTL_CACHE.get_or_compute(cache_key, cache_ttl, _loader, cache_none=True, none_ttl_seconds=NEGATIVE_CACHE_TTL_SECONDS)
+
+
+def fetch_text(url: str, method: str = "GET", timeout: int = HTTP_DEFAULT_TIMEOUT, headers: Optional[dict] = None, data: Optional[dict] = None, retries: int = HTTP_RETRIES, cache_ttl: int = API_CACHE_TTL_SECONDS):
+    payload_key = tuple(sorted((data or {}).items()))
+    cache_key = ("text", method.upper(), url, payload_key, timeout, tuple(sorted((headers or {}).items())))
+    final_headers = headers or {"User-Agent": "Mozilla/5.0"}
+
+    def _loader():
+        for attempt in range(max(1, retries)):
+            try:
+                if method.upper() == "POST":
+                    resp = requests.post(url, data=data or {}, timeout=timeout, headers=final_headers)
+                else:
+                    resp = requests.get(url, timeout=timeout, headers=final_headers)
+                resp.raise_for_status()
+                return resp.text
+            except Exception:
+                if attempt >= max(1, retries) - 1:
+                    return None
+                time.sleep(HTTP_RETRY_SLEEP * (attempt + 1))
+        return None
+
+    return GLOBAL_TTL_CACHE.get_or_compute(cache_key, cache_ttl, _loader, cache_none=True, none_ttl_seconds=NEGATIVE_CACHE_TTL_SECONDS)
+
+
+def get_yf_ticker(symbol: str):
+    key = ("yf_ticker", symbol)
+    return cached_call(key, YF_TICKER_CACHE_TTL_SECONDS, lambda: yf.Ticker(symbol), cache_none=False)
+
+
+def clean_symbol_for_external_api(symbol: str) -> str:
+    symbol = (symbol or "").strip().upper()
+    if symbol.endswith(".TW") or symbol.endswith(".TWO"):
+        return symbol.split(".")[0]
+    return symbol
+
+
+def merge_fundamental_dicts(*parts):
+    merged = {}
+    source_notes = []
+    missing_reasons = []
+    for part in parts:
+        if not part:
+            continue
+        for k, v in part.items():
+            if k in {"source_note", "missing_reasons"}:
+                continue
+            if merged.get(k) is None and v is not None:
+                merged[k] = v
+        note = part.get("source_note")
+        if note:
+            source_notes.append(note)
+        for reason in part.get("missing_reasons", []) or []:
+            if reason and reason not in missing_reasons:
+                missing_reasons.append(reason)
+    merged["source_note"] = "；".join(source_notes) if source_notes else "無"
+    merged["missing_reasons"] = missing_reasons
+    return merged if merged else None
+
+
+def get_fundamentals_from_yfinance(symbol: str, ticker=None):
+    try:
+        ticker = ticker or get_yf_ticker(symbol)
+        q_income = cached_call(("yf_quarterly_income_stmt", symbol), YF_INFO_CACHE_TTL_SECONDS, lambda: getattr(ticker, "quarterly_income_stmt", None), cache_none=True, none_ttl_seconds=NEGATIVE_CACHE_TTL_SECONDS)
+        yearly_income = cached_call(("yf_income_stmt", symbol), YF_INFO_CACHE_TTL_SECONDS, lambda: getattr(ticker, "income_stmt", None), cache_none=True, none_ttl_seconds=NEGATIVE_CACHE_TTL_SECONDS)
+
+        revenue = operating_income = net_income = basic_eps = diluted_eps = None
+        source_parts = []
+
+        if q_income is not None and not q_income.empty:
+            revenue = pick_first_valid_series(q_income, ["Total Revenue", "Operating Revenue", "Revenue"])
+            operating_income = pick_first_valid_series(q_income, ["Operating Income", "EBIT"])
+            net_income = pick_first_valid_series(q_income, ["Net Income", "Net Income Common Stockholders", "Net Income Including Noncontrolling Interests"])
+            basic_eps = pick_first_valid_series(q_income, ["Basic EPS", "Diluted EPS"])
+            diluted_eps = pick_first_valid_series(q_income, ["Diluted EPS", "Basic EPS"])
+            source_parts.append("Yahoo quarterly_income_stmt")
+
+        if yearly_income is not None and not yearly_income.empty:
+            if revenue is None:
+                revenue = pick_first_valid_series(yearly_income, ["Total Revenue", "Operating Revenue", "Revenue"])
+            if operating_income is None:
+                operating_income = pick_first_valid_series(yearly_income, ["Operating Income", "EBIT"])
+            if net_income is None:
+                net_income = pick_first_valid_series(yearly_income, ["Net Income", "Net Income Common Stockholders", "Net Income Including Noncontrolling Interests"])
+            if basic_eps is None:
+                basic_eps = pick_first_valid_series(yearly_income, ["Basic EPS", "Diluted EPS"])
+            if diluted_eps is None:
+                diluted_eps = pick_first_valid_series(yearly_income, ["Diluted EPS", "Basic EPS"])
+            source_parts.append("Yahoo income_stmt")
+
+        cols = []
+        for s in [revenue, operating_income, net_income, basic_eps, diluted_eps]:
+            if s is not None:
+                cols.extend(list(s.index))
+        cols = sorted(set(cols), reverse=True)
+        if cols:
+            revenue = revenue.reindex(cols) if revenue is not None else None
+            operating_income = operating_income.reindex(cols) if operating_income is not None else None
+            net_income = net_income.reindex(cols) if net_income is not None else None
+            basic_eps = basic_eps.reindex(cols) if basic_eps is not None else None
+            diluted_eps = diluted_eps.reindex(cols) if diluted_eps is not None else None
+
+        eps_series = diluted_eps if diluted_eps is not None else basic_eps
+        latest_revenue = revenue.iloc[0] if revenue is not None and len(revenue) >= 1 else None
+        latest_net_income = net_income.iloc[0] if net_income is not None and len(net_income) >= 1 else None
+        latest_operating_income = operating_income.iloc[0] if operating_income is not None and len(operating_income) >= 1 else None
+
+        net_margin = operating_margin = None
+        if latest_revenue is not None and pd.notna(latest_revenue) and float(latest_revenue) != 0:
+            if latest_net_income is not None and pd.notna(latest_net_income):
+                net_margin = float(latest_net_income) / float(latest_revenue) * 100
+            if latest_operating_income is not None and pd.notna(latest_operating_income):
+                operating_margin = float(latest_operating_income) / float(latest_revenue) * 100
+
+        eps_ttm = latest_eps = eps_growth_yoy = None
+        if eps_series is not None and not eps_series.dropna().empty:
+            eps_series = pd.to_numeric(eps_series, errors="coerce").dropna()
+            if len(eps_series) >= 1:
+                latest_eps = eps_series.iloc[0]
+            if len(eps_series) >= 4:
+                eps_ttm = eps_series.iloc[:4].sum()
+            if len(eps_series) >= 5 and abs(float(eps_series.iloc[4])) > 1e-9:
+                eps_growth_yoy = (float(eps_series.iloc[0]) - float(eps_series.iloc[4])) / abs(float(eps_series.iloc[4])) * 100
+
+        info = cached_call(("yf_info", symbol), YF_INFO_CACHE_TTL_SECONDS, lambda: getattr(ticker, "info", {}) or {}, cache_none=True, none_ttl_seconds=NEGATIVE_CACHE_TTL_SECONDS) or {}
+        trailing_pe = info.get("trailingPE")
+        forward_pe = info.get("forwardPE")
+        pb = info.get("priceToBook")
+        roe = info.get("returnOnEquity")
+        trailing_eps = info.get("trailingEps")
+
+        if latest_eps is None and trailing_eps is not None:
+            latest_eps = trailing_eps
+        if eps_ttm is None and trailing_eps is not None:
+            eps_ttm = trailing_eps
+        if roe is not None:
+            roe = float(roe) * 100
+
+        return {
+            "net_margin": round(net_margin, 2) if net_margin is not None else None,
+            "operating_margin": round(operating_margin, 2) if operating_margin is not None else None,
+            "eps_ttm": round(float(eps_ttm), 2) if eps_ttm is not None and pd.notna(eps_ttm) else None,
+            "latest_eps": round(float(latest_eps), 2) if latest_eps is not None and pd.notna(latest_eps) else None,
+            "eps_growth_yoy": round(float(eps_growth_yoy), 2) if eps_growth_yoy is not None and pd.notna(eps_growth_yoy) else None,
+            "trailing_pe": safe_float(trailing_pe, 2),
+            "forward_pe": safe_float(forward_pe, 2),
+            "price_to_book": safe_float(pb, 2),
+            "roe": safe_float(roe, 2),
+            "source_note": "Yahoo Finance" + ("（" + "、".join(dict.fromkeys(source_parts)) + "）" if source_parts else "（info）"),
+            "missing_reasons": [],
+        }
+    except Exception as e:
+        return {"source_note": "Yahoo Finance 失敗", "missing_reasons": [str(e)]}
+
+
+def get_fundamentals_from_fmp(symbol: str, asset_type: str):
+    api_key = os.environ.get("FMP_API_KEY", "").strip()
+    if not api_key or asset_type not in {"stock", "us_stock", "uk_stock"}:
+        return None
+    base_symbol = symbol if asset_type == "uk_stock" else clean_symbol_for_external_api(symbol)
+    apikey = quote(api_key)
+    urls = {
+        "profile": f"https://financialmodelingprep.com/stable/profile?symbol={quote(base_symbol)}&apikey={apikey}",
+        "key_metrics_ttm": f"https://financialmodelingprep.com/stable/key-metrics-ttm?symbol={quote(base_symbol)}&apikey={apikey}",
+        "ratios_ttm": f"https://financialmodelingprep.com/stable/ratios-ttm?symbol={quote(base_symbol)}&apikey={apikey}",
+        "income_ttm": f"https://financialmodelingprep.com/stable/income-statement-ttm?symbol={quote(base_symbol)}&apikey={apikey}",
+        "income_q": f"https://financialmodelingprep.com/stable/income-statement?symbol={quote(base_symbol)}&limit=6&apikey={apikey}",
+    }
+    profile = fetch_json(urls["profile"])
+    key_metrics_ttm = fetch_json(urls["key_metrics_ttm"])
+    ratios_ttm = fetch_json(urls["ratios_ttm"])
+    income_ttm = fetch_json(urls["income_ttm"])
+    income_q = fetch_json(urls["income_q"])
+
+    def first_obj(x):
+        return x[0] if isinstance(x, list) and x else (x if isinstance(x, dict) else {})
+
+    profile = first_obj(profile)
+    key_metrics_ttm = first_obj(key_metrics_ttm)
+    ratios_ttm = first_obj(ratios_ttm)
+    income_ttm = first_obj(income_ttm)
+    income_q = income_q if isinstance(income_q, list) else []
+
+    latest_eps = None
+    eps_ttm = safe_float(key_metrics_ttm.get("netIncomePerShareTTM") or key_metrics_ttm.get("epsTTM") or income_ttm.get("eps"), 2)
+    if income_q:
+        q0 = income_q[0] or {}
+        latest_eps = safe_float(q0.get("eps") or q0.get("epsdiluted"), 2)
+
+    eps_growth_yoy = None
+    if len(income_q) >= 5:
+        e0 = income_q[0].get("eps") or income_q[0].get("epsdiluted")
+        e4 = income_q[4].get("eps") or income_q[4].get("epsdiluted")
+        try:
+            if e0 is not None and e4 not in (None, 0, 0.0):
+                eps_growth_yoy = round((float(e0) - float(e4)) / abs(float(e4)) * 100, 2)
+        except Exception:
+            eps_growth_yoy = None
+
+    return {
+        "net_margin": safe_float(ratios_ttm.get("netProfitMarginTTM") or ratios_ttm.get("netProfitMargin"), 2),
+        "operating_margin": safe_float(ratios_ttm.get("operatingProfitMarginTTM") or ratios_ttm.get("operatingProfitMargin"), 2),
+        "eps_ttm": eps_ttm,
+        "latest_eps": latest_eps,
+        "eps_growth_yoy": eps_growth_yoy,
+        "trailing_pe": safe_float(key_metrics_ttm.get("peRatioTTM") or profile.get("pe"), 2),
+        "forward_pe": safe_float(profile.get("pe") or key_metrics_ttm.get("peRatioTTM"), 2),
+        "price_to_book": safe_float(key_metrics_ttm.get("pbRatioTTM") or profile.get("priceToBookRatio"), 2),
+        "roe": safe_float(((ratios_ttm.get("returnOnEquityTTM") or ratios_ttm.get("returnOnEquity")) * 100) if (ratios_ttm.get("returnOnEquityTTM") or ratios_ttm.get("returnOnEquity")) is not None else None, 2),
+        "source_note": "FMP 多來源",
+        "missing_reasons": [],
+    }
+
+
+def get_fundamentals_from_alpha_vantage(symbol: str, asset_type: str):
+    api_key = os.environ.get("ALPHAVANTAGE_API_KEY", "").strip()
+    if not api_key or asset_type not in {"stock", "us_stock", "uk_stock"}:
+        return None
+    base_symbol = symbol if asset_type == "uk_stock" else clean_symbol_for_external_api(symbol)
+    url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={quote(base_symbol)}&apikey={quote(api_key)}"
+    data = fetch_json(url)
+    if not isinstance(data, dict) or not data:
+        return None
+
+    def pct(field):
+        try:
+            v = data.get(field)
+            if v in (None, "", "None"):
+                return None
+            return round(float(v) * 100, 2)
+        except Exception:
+            return None
+
+    def num(field):
+        try:
+            v = data.get(field)
+            if v in (None, "", "None"):
+                return None
+            return round(float(v), 2)
+        except Exception:
+            return None
+
+    return {
+        "net_margin": None,
+        "operating_margin": pct("OperatingMarginTTM"),
+        "eps_ttm": num("EPS"),
+        "latest_eps": num("EPS"),
+        "eps_growth_yoy": None,
+        "trailing_pe": num("PERatio"),
+        "forward_pe": None,
+        "price_to_book": num("PriceToBookRatio"),
+        "roe": pct("ReturnOnEquityTTM"),
+        "source_note": "Alpha Vantage OVERVIEW",
+        "missing_reasons": [],
+    }
+
+
+def normalize_indicator_selection(selected_indicators: Optional[list[str]] = None):
+    allowed = ["price", "ma", "bollinger", "granville", "volume", "rsi", "kd", "macd"]
+    selected = [x for x in (selected_indicators or []) if x in allowed]
+    if not selected:
+        selected = ["price", "ma", "bollinger", "volume", "rsi", "kd"]
+    if any(x in selected for x in ["ma", "bollinger", "granville"]) and "price" not in selected:
+        selected.insert(0, "price")
+    ordered = []
+    for x in allowed:
+        if x in selected and x not in ordered:
+            ordered.append(x)
+    return ordered
 
 
 def resolve_tw_stock_symbol(query: str):
@@ -218,30 +717,7 @@ def get_chinese_name(query: str, symbol: str, asset_type: str) -> str:
         info = twstock.codes.get(code)
         if info and getattr(info, "name", None):
             return str(info.name).strip()
-    fx_name_map = {
-        "USDTWD=X": "美元兌台幣", "AUDTWD=X": "澳幣兌台幣", "JPYTWD=X": "日圓兌台幣", "EURTWD=X": "歐元兌台幣",
-    }
-    index_name_map = {"^TWII": "台灣加權指數"}
-    bond_name_map = {
-        "TLT": "20年美債 ETF", "IEF": "7-10年美債 ETF", "SHY": "短天期美債 ETF", "LQD": "投資等級債 ETF",
-        "HYG": "高收益債 ETF", "BND": "總體債券 ETF", "EMB": "新興市場債 ETF",
-    }
-    commodity_name_map = {
-        "GC=F": "黃金", "SI=F": "白銀", "PL=F": "白金", "PA=F": "鈀金", "CL=F": "紐約原油",
-        "BZ=F": "布蘭特原油", "NG=F": "天然氣", "HG=F": "銅", "ZC=F": "玉米", "ZS=F": "黃豆",
-        "ZW=F": "小麥", "KC=F": "咖啡", "CC=F": "可可", "CT=F": "棉花",
-    }
-    stock_name_map = {
-        "AAPL": "蘋果", "MSFT": "微軟", "NVDA": "輝達", "AMZN": "亞馬遜", "GOOGL": "谷歌", "TSLA": "特斯拉",
-        "META": "Meta", "BRK-B": "波克夏", "SPY": "標普500 ETF", "QQQ": "那斯達克100 ETF", "DIA": "道瓊 ETF",
-        "SOXX": "半導體 ETF", "VTI": "美股大盤 ETF", "VOO": "先鋒標普500 ETF", "HSBA.L": "匯豐控股",
-        "BP.L": "英國石油", "VOD.L": "沃達豐", "BARC.L": "巴克萊", "RR.L": "勞斯萊斯", "ULVR.L": "聯合利華",
-        "AAL.L": "英美資源", "AZN.L": "阿斯特捷利康", "RIO.L": "力拓",
-    }
-    for mp in [fx_name_map, index_name_map, bond_name_map, commodity_name_map, stock_name_map]:
-        if symbol in mp:
-            return mp[symbol]
-    return query
+    return ASSET_NAME_MAP.get(symbol, query)
 
 
 def normalize_symbol(query: str, market_scope: str = "auto") -> str:
@@ -291,24 +767,33 @@ def detect_asset_type(query: str, symbol: str, market_scope: str = "auto") -> st
     return "us_stock"
 
 
-def get_history(symbol: str) -> Tuple[pd.DataFrame, str]:
-    ticker = yf.Ticker(symbol)
-    hist = ticker.history(period="1y", interval="1d", auto_adjust=False)
+def get_history(symbol: str, ticker=None) -> Tuple[pd.DataFrame, str, object]:
+    ticker = ticker or get_yf_ticker(symbol)
+
+    def _load_history(target_symbol: str, target_ticker):
+        key = ("yf_history", target_symbol, "1y", "1d", False)
+        return cached_call(key, YF_HISTORY_CACHE_TTL_SECONDS, lambda: target_ticker.history(period="1y", interval="1d", auto_adjust=False), cache_none=True, none_ttl_seconds=NEGATIVE_CACHE_TTL_SECONDS)
+
+    hist = _load_history(symbol, ticker)
+    if hist is None:
+        hist = pd.DataFrame()
     if (hist.empty or len(hist) < 70) and symbol.endswith(".TW"):
         alt = symbol.replace(".TW", ".TWO")
-        ticker = yf.Ticker(alt)
-        hist_alt = ticker.history(period="1y", interval="1d", auto_adjust=False)
+        alt_ticker = get_yf_ticker(alt)
+        hist_alt = _load_history(alt, alt_ticker)
+        if hist_alt is None:
+            hist_alt = pd.DataFrame()
         if not hist_alt.empty and len(hist_alt) >= 70:
-            return hist_alt, alt
-    return hist, symbol
+            return hist_alt, alt, alt_ticker
+    return hist, symbol, ticker
 
 
-def estimate_dividend_yield(symbol: str, current_price: Optional[float]) -> Optional[float]:
+def estimate_dividend_yield(symbol: str, current_price: Optional[float], ticker=None) -> Optional[float]:
     if current_price is None or current_price <= 0:
         return None
     try:
-        ticker = yf.Ticker(symbol)
-        dividends = ticker.dividends
+        ticker = ticker or get_yf_ticker(symbol)
+        dividends = cached_call(("yf_dividends", symbol), YF_DIVIDEND_CACHE_TTL_SECONDS, lambda: ticker.dividends, cache_none=True, none_ttl_seconds=NEGATIVE_CACHE_TTL_SECONDS)
         if dividends is None or len(dividends) == 0:
             return None
         dividends = dividends.dropna()
@@ -335,77 +820,309 @@ def pick_first_valid_series(df: Optional[pd.DataFrame], candidates: list[str]) -
     return None
 
 
-def get_fundamental_metrics(symbol: str, asset_type: str):
-    if asset_type not in {"stock", "us_stock", "uk_stock"}:
+
+def get_tw_market_info_by_symbol(symbol: str):
+    if symbol.endswith('.TW'):
+        return {"market": "listed", "typek": "sii", "code": symbol.split('.')[0]}
+    if symbol.endswith('.TWO'):
+        return {"market": "otc", "typek": "otc", "code": symbol.split('.')[0]}
+    return None
+
+
+def try_parse_number(value, digits: Optional[int] = None):
+    if value is None:
         return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        out = float(value)
+        return round(out, digits) if digits is not None else out
+    s = str(value).strip()
+    if not s or s in {'--', '---', '----', 'N/A', 'nan', 'None'}:
+        return None
+    s = s.replace(',', '').replace('%', '').replace('％', '').replace('元', '').replace(' ', '')
+    s = s.replace('(', '-').replace(')', '')
+    s = s.replace('－', '-').replace('—', '-')
     try:
-        ticker = yf.Ticker(symbol)
-        q_income = getattr(ticker, "quarterly_income_stmt", None)
-        if q_income is None or q_income.empty:
-            return None
-        revenue = pick_first_valid_series(q_income, ["Total Revenue", "Operating Revenue", "Revenue"])
-        operating_income = pick_first_valid_series(q_income, ["Operating Income", "EBIT"])
-        net_income = pick_first_valid_series(q_income, ["Net Income", "Net Income Common Stockholders", "Net Income Including Noncontrolling Interests"])
-        basic_eps = pick_first_valid_series(q_income, ["Basic EPS", "Diluted EPS"])
-        diluted_eps = pick_first_valid_series(q_income, ["Diluted EPS", "Basic EPS"])
-        cols = []
-        for s in [revenue, operating_income, net_income, basic_eps, diluted_eps]:
-            if s is not None:
-                cols.extend(list(s.index))
-        cols = sorted(set(cols), reverse=True)
-        if not cols:
-            return None
-        revenue = revenue.reindex(cols) if revenue is not None else None
-        operating_income = operating_income.reindex(cols) if operating_income is not None else None
-        net_income = net_income.reindex(cols) if net_income is not None else None
-        basic_eps = basic_eps.reindex(cols) if basic_eps is not None else None
-        diluted_eps = diluted_eps.reindex(cols) if diluted_eps is not None else None
-        eps_series = diluted_eps if diluted_eps is not None else basic_eps
-
-        latest_revenue = revenue.iloc[0] if revenue is not None and len(revenue) >= 1 else None
-        latest_net_income = net_income.iloc[0] if net_income is not None and len(net_income) >= 1 else None
-        latest_operating_income = operating_income.iloc[0] if operating_income is not None and len(operating_income) >= 1 else None
-        net_margin = None
-        operating_margin = None
-        if latest_revenue is not None and pd.notna(latest_revenue) and float(latest_revenue) != 0:
-            if latest_net_income is not None and pd.notna(latest_net_income):
-                net_margin = float(latest_net_income) / float(latest_revenue) * 100
-            if latest_operating_income is not None and pd.notna(latest_operating_income):
-                operating_margin = float(latest_operating_income) / float(latest_revenue) * 100
-
-        eps_ttm = None
-        latest_eps = None
-        eps_growth_yoy = None
-        if eps_series is not None and not eps_series.dropna().empty:
-            eps_series = pd.to_numeric(eps_series, errors="coerce")
-            latest_eps = eps_series.iloc[0] if len(eps_series) >= 1 and pd.notna(eps_series.iloc[0]) else None
-            if len(eps_series.dropna()) >= 4:
-                eps_ttm = eps_series.iloc[:4].sum()
-            if len(eps_series) >= 5 and pd.notna(eps_series.iloc[0]) and pd.notna(eps_series.iloc[4]) and abs(float(eps_series.iloc[4])) > 1e-9:
-                eps_growth_yoy = (float(eps_series.iloc[0]) - float(eps_series.iloc[4])) / abs(float(eps_series.iloc[4])) * 100
-
-        info = getattr(ticker, "info", {}) or {}
-        trailing_pe = info.get("trailingPE")
-        forward_pe = info.get("forwardPE")
-        pb = info.get("priceToBook")
-        roe = info.get("returnOnEquity")
-        if roe is not None:
-            roe = float(roe) * 100
-
-        return {
-            "net_margin": round(net_margin, 2) if net_margin is not None else None,
-            "operating_margin": round(operating_margin, 2) if operating_margin is not None else None,
-            "eps_ttm": round(float(eps_ttm), 2) if eps_ttm is not None and pd.notna(eps_ttm) else None,
-            "latest_eps": round(float(latest_eps), 2) if latest_eps is not None and pd.notna(latest_eps) else None,
-            "eps_growth_yoy": round(float(eps_growth_yoy), 2) if eps_growth_yoy is not None and pd.notna(eps_growth_yoy) else None,
-            "trailing_pe": safe_float(trailing_pe, 2),
-            "forward_pe": safe_float(forward_pe, 2),
-            "price_to_book": safe_float(pb, 2),
-            "roe": safe_float(roe, 2),
-            "source_note": "以 Yahoo Finance 財報 / info 資料估算。",
-        }
+        out = float(s)
+        return round(out, digits) if digits is not None else out
     except Exception:
         return None
+
+
+def normalize_table_columns(df: pd.DataFrame) -> pd.DataFrame:
+    new_cols = []
+    for c in df.columns:
+        if isinstance(c, tuple):
+            c = '_'.join(str(x) for x in c if str(x) != 'nan')
+        c = str(c).replace('　', '').replace(' ', '').replace('\n', '').strip()
+        new_cols.append(c)
+    out = df.copy()
+    out.columns = new_cols
+    return out
+
+
+def roc_year_quarter_candidates(count: int = 8):
+    today = date.today()
+    quarter = (today.month - 1) // 3 + 1
+    roc_year = today.year - 1911
+    vals = []
+    y, q = roc_year, quarter
+    for _ in range(count):
+        vals.append((y, q))
+        q -= 1
+        if q == 0:
+            q = 4
+            y -= 1
+    return vals
+
+
+def build_recent_date_candidates(days: int = 14):
+    today = date.today()
+    return [(today - timedelta(days=i)).strftime('%Y%m%d') for i in range(days)]
+
+
+def build_recent_roc_date_candidates(days: int = 14):
+    today = date.today()
+    vals = []
+    for i in range(days):
+        d = today - timedelta(days=i)
+        vals.append(f"{d.year - 1911}/{d.month:02d}/{d.day:02d}")
+    return vals
+
+
+def find_row_by_code(df: pd.DataFrame, code: str):
+    if df is None or df.empty:
+        return None
+    df = normalize_table_columns(df)
+    target = str(code).strip()
+    candidate_cols = [c for c in df.columns if any(k in c for k in ['公司代號', '股票代號', '證券代號', '代號'])]
+    if not candidate_cols:
+        candidate_cols = list(df.columns[:2])
+    for col in candidate_cols:
+        mask = df[col].astype(str).str.replace(' ', '').str.strip() == target
+        if mask.any():
+            return df.loc[mask].iloc[0]
+    for col in candidate_cols:
+        values = df[col].astype(str).str.replace(' ', '').str.strip().tolist()
+        match = difflib.get_close_matches(target, values, n=1, cutoff=0.85)
+        if match:
+            mask = df[col].astype(str).str.replace(' ', '').str.strip() == match[0]
+            if mask.any():
+                return df.loc[mask].iloc[0]
+    for _, row in df.iterrows():
+        first_two = ''.join(str(v) for v in row.iloc[:2].tolist()).replace(' ', '')
+        if target in first_two:
+            return row
+    return None
+
+
+def get_value_from_row(row, keywords: list[str], digits: Optional[int] = 2):
+    if row is None:
+        return None
+    for col, val in row.items():
+        col_s = str(col).replace(' ', '')
+        if any(k in col_s for k in keywords):
+            out = try_parse_number(val, digits)
+            if out is not None:
+                return out
+    return None
+
+
+def fetch_twse_official_bwibbu(code: str):
+    for d in build_recent_date_candidates(20):
+        url = f'https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d?response=json&date={d}&selectType=ALL'
+        data = fetch_json(url)
+        if not isinstance(data, dict):
+            continue
+        rows = data.get('data') or []
+        fields = data.get('fields') or []
+        if not rows or not fields:
+            continue
+        try:
+            df = pd.DataFrame(rows, columns=fields)
+        except Exception:
+            continue
+        row = find_row_by_code(df, code)
+        if row is None:
+            continue
+        return {
+            'trailing_pe': get_value_from_row(row, ['本益比']),
+            'price_to_book': get_value_from_row(row, ['股價淨值比']),
+            'dividend_yield_official': get_value_from_row(row, ['殖利率']),
+            'source_note': f'TWSE 官方 BWIBBU_d ({d})',
+            'missing_reasons': [],
+        }
+    return {'source_note': 'TWSE 官方 BWIBBU_d 未取得', 'missing_reasons': ['找不到上市公司本益比/淨值比官方資料']}
+
+
+def fetch_tpex_official_pepb(code: str):
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    for d in build_recent_roc_date_candidates(20):
+        # 舊版官方 CSV 介面；若未來欄位變動，仍可由 missing_reasons 提示
+        url = f'https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php?l=zh-tw&o=csv&d={quote(d)}&s=0,asc,0'
+        text = fetch_text(url, headers=headers, timeout=12, retries=HTTP_RETRIES, cache_ttl=TW_OFFICIAL_CACHE_TTL_SECONDS)
+        if not text:
+            continue
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        csv_text = '\n'.join(lines)
+        try:
+            df = pd.read_csv(io.StringIO(csv_text))
+        except Exception:
+            try:
+                df = pd.read_csv(io.StringIO(csv_text), encoding='utf-8')
+            except Exception:
+                continue
+        row = find_row_by_code(df, code)
+        if row is None:
+            continue
+        return {
+            'trailing_pe': get_value_from_row(row, ['本益比']),
+            'price_to_book': get_value_from_row(row, ['股價淨值比']),
+            'dividend_yield_official': get_value_from_row(row, ['殖利率']),
+            'source_note': f'TPEx 官方 pera_result ({d})',
+            'missing_reasons': [],
+        }
+    return {'source_note': 'TPEx 官方 pera_result 未取得', 'missing_reasons': ['找不到上櫃公司本益比/淨值比官方資料']}
+
+
+def fetch_tw_official_valuation(symbol: str):
+    info = get_tw_market_info_by_symbol(symbol)
+    if not info:
+        return None
+    if info['market'] == 'listed':
+        return fetch_twse_official_bwibbu(info['code'])
+    return fetch_tpex_official_pepb(info['code'])
+
+
+def fetch_mops_statement_table(report: str, typek: str, year: int, season: int):
+    url = f'https://mops.twse.com.tw/mops/web/{report}'
+    payload = {
+        'encodeURIComponent': 1,
+        'step': 1,
+        'firstin': 1,
+        'off': 1,
+        'isQuery': 'Y',
+        'TYPEK': typek,
+        'year': str(year),
+        'season': f'{season:02d}',
+    }
+    headers = {'User-Agent': 'Mozilla/5.0', 'Referer': url}
+    html_text = fetch_text(url, method='POST', data=payload, timeout=18, headers=headers, retries=HTTP_RETRIES, cache_ttl=TW_OFFICIAL_CACHE_TTL_SECONDS)
+    if not html_text:
+        return []
+    try:
+        tables = pd.read_html(html_text)
+        return [normalize_table_columns(t) for t in tables]
+    except Exception:
+        return []
+
+
+def extract_tw_quarter_fundamentals_from_mops(symbol: str):
+    info = get_tw_market_info_by_symbol(symbol)
+    if not info:
+        return None
+    code = info['code']
+    typek = info['typek']
+    quarters = []
+    missing_reasons = []
+    saw_income_table = False
+    saw_balance_table = False
+
+    for year, season in roc_year_quarter_candidates(8):
+        income_tables = fetch_mops_statement_table('t163sb04', typek, year, season)
+        if income_tables:
+            saw_income_table = True
+        income_row = None
+        for t in income_tables:
+            income_row = find_row_by_code(t, code)
+            if income_row is not None:
+                break
+        if income_row is None:
+            continue
+        revenue = get_value_from_row(income_row, ['營業收入', '收入合計'])
+        operating_income = get_value_from_row(income_row, ['營業利益', '營業淨利'])
+        net_income = get_value_from_row(income_row, ['本期淨利', '本期稅後淨利', '歸屬於母公司業主之淨利', '歸屬於母公司業主淨利'])
+        latest_eps = get_value_from_row(income_row, ['基本每股盈餘', '每股盈餘'])
+        if latest_eps is None:
+            latest_eps = get_value_from_row(income_row, ['稀釋每股盈餘'])
+        net_margin = round(net_income / revenue * 100, 2) if net_income not in (None, 0) and revenue not in (None, 0) else None
+        operating_margin = round(operating_income / revenue * 100, 2) if operating_income not in (None, 0) and revenue not in (None, 0) else None
+
+        equity = None
+        balance_tables = fetch_mops_statement_table('t163sb05', typek, year, season)
+        if balance_tables:
+            saw_balance_table = True
+        bal_row = None
+        for t in balance_tables:
+            bal_row = find_row_by_code(t, code)
+            if bal_row is not None:
+                break
+        if bal_row is not None:
+            equity = get_value_from_row(bal_row, ['權益總額', '權益總計', '總權益'])
+
+        quarters.append({
+            'year': year, 'season': season, 'revenue': revenue, 'operating_income': operating_income,
+            'net_income': net_income, 'latest_eps': latest_eps, 'net_margin': net_margin,
+            'operating_margin': operating_margin, 'equity': equity,
+        })
+        if len(quarters) >= 5:
+            break
+
+    if not quarters:
+        if not saw_income_table:
+            missing_reasons.append('MOPS 連線失敗或查無報表頁面')
+        else:
+            missing_reasons.append('MOPS 表格已取得，但找不到公司代號列，可能是欄位名稱或表格格式變動')
+        if saw_income_table and not saw_balance_table:
+            missing_reasons.append('資產負債表未成功解析，ROE 可能無法計算')
+        return {'source_note': 'MOPS 官方財報未取得', 'missing_reasons': missing_reasons}
+
+    latest = quarters[0]
+    eps_vals = [q['latest_eps'] for q in quarters if q.get('latest_eps') is not None]
+    eps_ttm = round(sum(eps_vals[:4]), 2) if len(eps_vals) >= 4 else (round(eps_vals[0], 2) if eps_vals else None)
+    eps_growth_yoy = None
+    if len(quarters) >= 5 and latest.get('latest_eps') is not None and quarters[4].get('latest_eps') not in (None, 0):
+        eps_growth_yoy = round((latest['latest_eps'] - quarters[4]['latest_eps']) / abs(quarters[4]['latest_eps']) * 100, 2)
+
+    roe = None
+    if latest.get('equity') not in (None, 0) and latest.get('net_income') is not None:
+        try:
+            annualized_income = latest['net_income'] * 4
+            roe = round(annualized_income / latest['equity'] * 100, 2)
+        except Exception:
+            roe = None
+
+    source_quarters = ', '.join([f"{q['year']}Q{q['season']}" for q in quarters[:4]])
+    return {
+        'net_margin': latest.get('net_margin'),
+        'operating_margin': latest.get('operating_margin'),
+        'eps_ttm': eps_ttm,
+        'latest_eps': safe_float(latest.get('latest_eps'), 2),
+        'eps_growth_yoy': eps_growth_yoy,
+        'roe': roe,
+        'source_note': f'MOPS 官方季報 ({source_quarters})',
+        'missing_reasons': missing_reasons,
+    }
+
+def get_fundamental_metrics(symbol: str, asset_type: str, ticker=None):
+    if asset_type not in {"stock", "us_stock", "uk_stock"}:
+        return None
+    tw_official_statement = extract_tw_quarter_fundamentals_from_mops(symbol) if asset_type == "stock" else None
+    tw_official_valuation = fetch_tw_official_valuation(symbol) if asset_type == "stock" else None
+    yf_part = get_fundamentals_from_yfinance(symbol, ticker=ticker)
+    fmp_part = get_fundamentals_from_fmp(symbol, asset_type)
+    av_part = get_fundamentals_from_alpha_vantage(symbol, asset_type)
+    if asset_type == "stock":
+        merged = merge_fundamental_dicts(tw_official_statement, tw_official_valuation, yf_part, fmp_part, av_part)
+        if merged:
+            if merged.get("dividend_yield_official") is not None and merged.get("source_note"):
+                merged["source_note"] += "；含官方本益比/淨值比/殖利率"
+    else:
+        merged = merge_fundamental_dicts(yf_part, fmp_part, av_part)
+    if not merged:
+        return None
+    if not any(merged.get(k) is not None for k in ["net_margin", "operating_margin", "eps_ttm", "latest_eps", "eps_growth_yoy", "trailing_pe", "forward_pe", "price_to_book", "roe"]):
+        merged["source_note"] = (merged.get("source_note") or "無") + "；目前所有來源都沒有可用基本面欄位"
+    return merged
 
 
 def common_metrics(hist: pd.DataFrame):
@@ -877,10 +1594,12 @@ def detect_granville_points(hist: pd.DataFrame, lookback: int = 180):
     return points
 
 
-def create_chart_html(hist: pd.DataFrame, asset_type_label: str) -> str:
+def create_chart_html(hist: pd.DataFrame, asset_type_label: str, chart_mode: str = "combo", selected_indicators: Optional[list[str]] = None) -> str:
     df = hist.copy().dropna()
     if df.empty:
         return ""
+
+    selected = normalize_indicator_selection(selected_indicators)
     close = df["Close"]
     volume = df["Volume"]
     sma5 = close.rolling(5).mean()
@@ -888,112 +1607,105 @@ def create_chart_html(hist: pd.DataFrame, asset_type_label: str) -> str:
     sma60 = close.rolling(60).mean()
     rsi14 = calc_rsi(close, 14)
     k, d = calc_kd(df, 9, 3, 3)
+    macd, macd_signal, macd_hist = calc_macd(close)
     bb_mid, bb_upper, bb_lower, _ = calc_bollinger(close, 20, 2)
     granville_points = detect_granville_points(df, lookback=180)
 
-    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.5, 0.15, 0.17, 0.18], subplot_titles=("K線圖（含布林通道 / 葛蘭碧買賣點）", "成交量", "RSI", "KD"))
-    fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="K線"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=sma5, mode="lines", name="5MA"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=sma20, mode="lines", name="20MA"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=sma60, mode="lines", name="60MA"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=bb_upper, mode="lines", name="布林上軌", line=dict(dash="dot")), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=bb_mid, mode="lines", name="布林中軌", line=dict(dash="dot")), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=bb_lower, mode="lines", name="布林下軌", line=dict(dash="dot")), row=1, col=1)
+    def add_price_panel(fig, row_idx: int):
+        fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="K線"), row=row_idx, col=1)
+        if "ma" in selected:
+            fig.add_trace(go.Scatter(x=df.index, y=sma5, mode="lines", name="5MA"), row=row_idx, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=sma20, mode="lines", name="20MA"), row=row_idx, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=sma60, mode="lines", name="60MA"), row=row_idx, col=1)
+        if "bollinger" in selected:
+            fig.add_trace(go.Scatter(x=df.index, y=bb_upper, mode="lines", name="布林上軌", line=dict(dash="dot")), row=row_idx, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=bb_mid, mode="lines", name="布林中軌", line=dict(dash="dash")), row=row_idx, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=bb_lower, mode="lines", name="布林下軌", line=dict(dash="dot")), row=row_idx, col=1)
+        if "granville" in selected:
+            buy_points = [p for p in granville_points if p["side"] == "buy"]
+            sell_points = [p for p in granville_points if p["side"] == "sell"]
+            if buy_points:
+                fig.add_trace(go.Scatter(x=[p["date"] for p in buy_points], y=[p["price"] for p in buy_points], mode="markers+text", name="葛蘭碧買點", text=[p["rule"] for p in buy_points], textposition="top center", marker=dict(symbol="triangle-up", size=12, color="#16a34a")), row=row_idx, col=1)
+            if sell_points:
+                fig.add_trace(go.Scatter(x=[p["date"] for p in sell_points], y=[p["price"] for p in sell_points], mode="markers+text", name="葛蘭碧賣點", text=[p["rule"] for p in sell_points], textposition="bottom center", marker=dict(symbol="triangle-down", size=12, color="#dc2626")), row=row_idx, col=1)
 
-    buy_points = [p for p in granville_points if p["side"] == "buy"]
-    sell_points = [p for p in granville_points if p["side"] == "sell"]
-    if buy_points:
-        fig.add_trace(go.Scatter(x=[p["date"] for p in buy_points], y=[p["price"] for p in buy_points], mode="markers+text", name="葛蘭碧買點", text=[p["rule"] for p in buy_points], textposition="top center", marker=dict(symbol="triangle-up", size=12, color="#16a34a"), customdata=[[p["signal"], p["reason"]] for p in buy_points], hovertemplate="日期：%{x|%Y-%m-%d}<br>價位：%{y:.2f}<br>訊號：%{text}<br>狀態：%{customdata[0]}<br>說明：%{customdata[1]}<extra></extra>"), row=1, col=1)
-    if sell_points:
-        fig.add_trace(go.Scatter(x=[p["date"] for p in sell_points], y=[p["price"] for p in sell_points], mode="markers+text", name="葛蘭碧賣點", text=[p["rule"] for p in sell_points], textposition="bottom center", marker=dict(symbol="triangle-down", size=12, color="#dc2626"), customdata=[[p["signal"], p["reason"]] for p in sell_points], hovertemplate="日期：%{x|%Y-%m-%d}<br>價位：%{y:.2f}<br>訊號：%{text}<br>狀態：%{customdata[0]}<br>說明：%{customdata[1]}<extra></extra>"), row=1, col=1)
-    fig.add_trace(go.Bar(x=df.index, y=volume, name="成交量"), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=rsi14, mode="lines", name="RSI"), row=3, col=1)
-    fig.add_hline(y=70, row=3, col=1)
-    fig.add_hline(y=30, row=3, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=k, mode="lines", name="K"), row=4, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=d, mode="lines", name="D"), row=4, col=1)
-    fig.add_hline(y=80, row=4, col=1)
-    fig.add_hline(y=20, row=4, col=1)
-    fig.update_layout(height=980, xaxis_rangeslider_visible=False, margin=dict(l=20, r=20, t=50, b=20), legend=dict(orientation="h"), template="plotly_white", title=f"{asset_type_label} 技術圖表")
+    chart_mode = chart_mode if chart_mode in {"combo", "single"} else "combo"
+
+    if chart_mode == "single":
+        blocks = []
+        panels = []
+        if "price" in selected:
+            panels.append("price")
+        for x in ["volume", "rsi", "kd", "macd"]:
+            if x in selected:
+                panels.append(x)
+        for panel in panels:
+            title_map = {"price": "價格 / 均線 / 布林 / 葛蘭碧", "volume": "成交量", "rsi": "RSI", "kd": "KD", "macd": "MACD"}
+            fig = make_subplots(rows=1, cols=1, subplot_titles=(title_map.get(panel, panel),))
+            if panel == "price":
+                add_price_panel(fig, 1)
+            elif panel == "volume":
+                fig.add_trace(go.Bar(x=df.index, y=volume, name="成交量"), row=1, col=1)
+            elif panel == "rsi":
+                fig.add_trace(go.Scatter(x=df.index, y=rsi14, mode="lines", name="RSI"), row=1, col=1)
+                fig.add_hline(y=70, row=1, col=1)
+                fig.add_hline(y=30, row=1, col=1)
+            elif panel == "kd":
+                fig.add_trace(go.Scatter(x=df.index, y=k, mode="lines", name="K"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=d, mode="lines", name="D"), row=1, col=1)
+                fig.add_hline(y=80, row=1, col=1)
+                fig.add_hline(y=20, row=1, col=1)
+            elif panel == "macd":
+                fig.add_trace(go.Scatter(x=df.index, y=macd, mode="lines", name="MACD"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df.index, y=macd_signal, mode="lines", name="Signal"), row=1, col=1)
+                fig.add_trace(go.Bar(x=df.index, y=macd_hist, name="Histogram"), row=1, col=1)
+            fig.update_layout(height=420, xaxis_rangeslider_visible=False, margin=dict(l=20, r=20, t=50, b=20), legend=dict(orientation="h"), template="plotly_white", title=f"{asset_type_label} {title_map.get(panel, panel)}")
+            blocks.append(fig.to_html(full_html=False, include_plotlyjs="cdn" if not blocks else False))
+        return "".join(blocks)
+
+    panel_specs = []
+    if "price" in selected:
+        panel_specs.append("price")
+    for x in ["volume", "rsi", "kd", "macd"]:
+        if x in selected:
+            panel_specs.append(x)
+    if not panel_specs:
+        panel_specs = ["price", "volume", "rsi", "kd"]
+
+    title_map = {"price": "K線 / 均線 / 布林 / 葛蘭碧", "volume": "成交量", "rsi": "RSI", "kd": "KD", "macd": "MACD"}
+    heights = []
+    for p in panel_specs:
+        heights.append(0.46 if p == "price" else 0.18)
+    total = sum(heights)
+    heights = [h / total for h in heights]
+    fig = make_subplots(rows=len(panel_specs), cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=heights, subplot_titles=tuple(title_map[p] for p in panel_specs))
+
+    row_idx = 1
+    for panel in panel_specs:
+        if panel == "price":
+            add_price_panel(fig, row_idx)
+        elif panel == "volume":
+            fig.add_trace(go.Bar(x=df.index, y=volume, name="成交量"), row=row_idx, col=1)
+        elif panel == "rsi":
+            fig.add_trace(go.Scatter(x=df.index, y=rsi14, mode="lines", name="RSI"), row=row_idx, col=1)
+            fig.add_hline(y=70, row=row_idx, col=1)
+            fig.add_hline(y=30, row=row_idx, col=1)
+        elif panel == "kd":
+            fig.add_trace(go.Scatter(x=df.index, y=k, mode="lines", name="K"), row=row_idx, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=d, mode="lines", name="D"), row=row_idx, col=1)
+            fig.add_hline(y=80, row=row_idx, col=1)
+            fig.add_hline(y=20, row=row_idx, col=1)
+        elif panel == "macd":
+            fig.add_trace(go.Scatter(x=df.index, y=macd, mode="lines", name="MACD"), row=row_idx, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=macd_signal, mode="lines", name="Signal"), row=row_idx, col=1)
+            fig.add_trace(go.Bar(x=df.index, y=macd_hist, name="Histogram"), row=row_idx, col=1)
+        row_idx += 1
+
+    fig.update_layout(height=max(540, 280 * len(panel_specs)), xaxis_rangeslider_visible=False, margin=dict(l=20, r=20, t=50, b=20), legend=dict(orientation="h"), template="plotly_white", title=f"{asset_type_label} 技術圖表（{ ' / '.join(panel_specs) }）")
     return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
-def create_efficient_frontier_html(price_df: pd.DataFrame) -> str:
-    if price_df is None or price_df.empty or price_df.shape[1] < 2:
-        return ""
-    returns = price_df.pct_change().dropna()
-    if returns.empty:
-        return ""
-    mu = returns.mean() * 252
-    cov = returns.cov() * 252
-    assets = list(price_df.columns)
-    points = []
-    best_sharpe = None
-    min_vol = None
-    equal_weights = np.array([1 / len(assets)] * len(assets))
-    np.random.seed(42)
-    for _ in range(600):
-        w = np.random.random(len(assets))
-        w = w / w.sum()
-        ret = float(np.dot(w, mu))
-        vol = float(np.sqrt(np.dot(w.T, np.dot(cov, w))))
-        sharpe = ret / vol if vol > 0 else None
-        row = {"ret": ret, "vol": vol, "sharpe": sharpe, "weights": w}
-        points.append(row)
-        if sharpe is not None and (best_sharpe is None or sharpe > best_sharpe["sharpe"]):
-            best_sharpe = row
-        if min_vol is None or vol < min_vol["vol"]:
-            min_vol = row
-    eq_ret = float(np.dot(equal_weights, mu))
-    eq_vol = float(np.sqrt(np.dot(equal_weights.T, np.dot(cov, equal_weights))))
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=[p["vol"] * 100 for p in points], y=[p["ret"] * 100 for p in points], mode="markers", name="隨機組合", marker=dict(size=7, opacity=0.5)))
-    if best_sharpe:
-        fig.add_trace(go.Scatter(x=[best_sharpe["vol"] * 100], y=[best_sharpe["ret"] * 100], mode="markers+text", name="最大夏普", text=["最大夏普"], textposition="top center", marker=dict(size=14, color="#dc2626")))
-    if min_vol:
-        fig.add_trace(go.Scatter(x=[min_vol["vol"] * 100], y=[min_vol["ret"] * 100], mode="markers+text", name="最小波動", text=["最小波動"], textposition="bottom center", marker=dict(size=14, color="#2563eb")))
-    fig.add_trace(go.Scatter(x=[eq_vol * 100], y=[eq_ret * 100], mode="markers+text", name="等權重", text=["等權重"], textposition="middle right", marker=dict(size=12, color="#16a34a")))
-    fig.update_layout(title="效率前緣（年化報酬 / 年化波動）", template="plotly_white", xaxis_title="年化波動 %", yaxis_title="年化報酬 %", height=520, margin=dict(l=20, r=20, t=50, b=20))
-    return fig.to_html(full_html=False, include_plotlyjs=False)
-
-
-def compute_portfolio_analysis(symbols: list[str], market_scope: str = "auto"):
-    cleaned = []
-    for raw in symbols:
-        s = raw.strip()
-        if not s:
-            continue
-        sym = normalize_symbol(s, market_scope=market_scope if market_scope in {"us", "uk", "tw"} else "auto")
-        cleaned.append(sym)
-    cleaned = list(dict.fromkeys(cleaned))
-    if len(cleaned) < 2:
-        return None
-    prices = pd.DataFrame()
-    rows = []
-    for sym in cleaned[:8]:
-        hist, real = get_history(sym)
-        if hist.empty or len(hist) < 70:
-            continue
-        close = hist["Close"].copy().rename(real)
-        prices = pd.concat([prices, close], axis=1)
-        ret = close.pct_change().dropna()
-        if ret.empty:
-            continue
-        ann_ret = float(ret.mean() * 252)
-        ann_vol = float(ret.std() * math.sqrt(252))
-        sharpe = ann_ret / ann_vol if ann_vol > 0 else None
-        rows.append({"symbol": real, "annual_return": ann_ret * 100, "annual_vol": ann_vol * 100, "sharpe": sharpe})
-    prices = prices.dropna()
-    if prices.shape[1] < 2 or not rows:
-        return None
-    rows = sorted(rows, key=lambda x: x["sharpe"] if x["sharpe"] is not None else -999, reverse=True)
-    best = rows[0]
-    frontier_html = create_efficient_frontier_html(prices)
-    table_rows = "".join(f"<tr><td>{r['symbol']}</td><td>{round(r['annual_return'], 2)}%</td><td>{round(r['annual_vol'], 2)}%</td><td>{round(r['sharpe'], 2) if r['sharpe'] is not None else 'N/A'}</td></tr>" for r in rows)
-    return {"rows": rows, "best": best, "frontier_html": frontier_html, "table_rows": table_rows}
-
-
-def build_result_dict(title: str, asset_type: str, asset_type_label: str, query: str, symbol: str, hist: pd.DataFrame, m: dict, scored: dict, cost_info=None, dividend_yield: Optional[float] = None, dividend_estimated: bool = False, fundamentals: Optional[dict] = None, budget: Optional[float] = None):
+def build_result_dict(title: str, asset_type: str, asset_type_label: str, query: str, symbol: str, hist: pd.DataFrame, m: dict, scored: dict, cost_info=None, dividend_yield: Optional[float] = None, dividend_estimated: bool = False, fundamentals: Optional[dict] = None, budget: Optional[float] = None, chart_mode: str = "combo", selected_indicators: Optional[list[str]] = None):
     digits = 4 if asset_type_label == "匯率" else 2
     yield_info = analyze_dividend_yield(dividend_yield, estimated=dividend_estimated)
     chinese_name = get_chinese_name(query, symbol, asset_type)
@@ -1004,6 +1716,7 @@ def build_result_dict(title: str, asset_type: str, asset_type_label: str, query:
     style_advice = get_style_advice(asset_type, m, scored)
     target_price = calc_target_price(m)
     order_plan = calc_order_plan(m.get("close"), budget, asset_type, m.get("atr14"), target_price)
+    indicators = normalize_indicator_selection(selected_indicators)
     return {
         "title": f"{title}｜{query}", "asset_type": asset_type_label, "symbol": symbol, "chinese_name": chinese_name,
         "close": safe_float(m["close"], digits), "sma5": safe_float(m["sma5"], digits), "sma20": safe_float(m["sma20"], digits), "sma60": safe_float(m["sma60"], digits),
@@ -1014,56 +1727,58 @@ def build_result_dict(title: str, asset_type: str, asset_type_label: str, query:
         "atr14": safe_float(m["atr14"], digits), "sharpe60": safe_float(m["sharpe60"], 2),
         "score": scored["score"], "signal": scored["signal"], "action": scored["action"], "timing": scored.get("timing"), "holder_action": scored.get("holder_action"),
         "reasons": scored["reasons"], "risk_note": scored["risk_note"], "granville_rule": scored.get("granville_rule"), "granville_signal": scored.get("granville_signal"), "granville_reason": scored.get("granville_reason"),
-        "granville_points": detect_granville_points(hist, lookback=180), "cost_info": cost_info, "chart_html": create_chart_html(hist, asset_type_label),
+        "granville_points": detect_granville_points(hist, lookback=180), "cost_info": cost_info,
+        "chart_mode": chart_mode, "selected_indicators": indicators, "chart_html": create_chart_html(hist, asset_type_label, chart_mode=chart_mode, selected_indicators=indicators),
         "dividend_yield": dividend_yield, "is_high_yield": yield_info["is_high_yield"], "yield_level": yield_info["yield_level"], "yield_advice": yield_info["yield_advice"], "yield_source": yield_info["yield_source"],
         "show_dividend_section": asset_type in {"stock", "us_stock", "uk_stock"}, "fundamentals": fundamentals, "news_query": news_query, "latest_news": latest_news,
         "news_impact": news_impact, "style_advice": style_advice, "target_price": target_price, "order_plan": order_plan, "ma_cross": ma_cross,
     }
 
 
-def resolve_dividend_input_or_estimate(symbol: str, current_price: Optional[float], user_input_yield: Optional[float], asset_type: str):
+def resolve_dividend_input_or_estimate(symbol: str, current_price: Optional[float], user_input_yield: Optional[float], asset_type: str, ticker=None):
     if asset_type not in {"stock", "us_stock", "uk_stock"}:
         return None, False
     if user_input_yield is not None:
         return user_input_yield, False
-    estimated = estimate_dividend_yield(symbol, current_price)
+    estimated = estimate_dividend_yield(symbol, current_price, ticker=ticker)
     if estimated is not None:
         return estimated, True
     return None, False
 
 
-def analyze_generic(symbol: str, query: str, title: str, asset_type: str, asset_label: str, cost: Optional[float], dividend_yield: Optional[float], budget: Optional[float]):
-    hist, real_symbol = get_history(symbol)
+def analyze_generic(symbol: str, query: str, title: str, asset_type: str, asset_label: str, cost: Optional[float], dividend_yield: Optional[float], budget: Optional[float], chart_mode: str = "combo", selected_indicators: Optional[list[str]] = None):
+    shared_ticker = get_yf_ticker(symbol)
+    hist, real_symbol, resolved_ticker = get_history(symbol, ticker=shared_ticker)
     if hist.empty or len(hist) < 70:
         return None, f"找不到 {query} 的有效{asset_label}資料。"
     m = common_metrics(hist)
-    fundamentals = get_fundamental_metrics(real_symbol, asset_type)
+    fundamentals = get_fundamental_metrics(real_symbol, asset_type, ticker=resolved_ticker)
     scored = score_signal(m, asset_type, fundamentals)
     cost_info = analyze_cost_plan(m["close"], cost, m["support"], m["resistance"], asset_type)
-    final_yield, estimated = resolve_dividend_input_or_estimate(real_symbol, m["close"], dividend_yield, asset_type)
-    return build_result_dict(title, asset_type, asset_label, query, real_symbol, hist, m, scored, cost_info, final_yield, estimated, fundamentals, budget=budget), None
+    final_yield, estimated = resolve_dividend_input_or_estimate(real_symbol, m["close"], dividend_yield, asset_type, ticker=resolved_ticker)
+    return build_result_dict(title, asset_type, asset_label, query, real_symbol, hist, m, scored, cost_info, final_yield, estimated, fundamentals, budget=budget, chart_mode=chart_mode, selected_indicators=selected_indicators), None
 
 
-def analyze_target(query: str, market_scope: str = "auto", cost: Optional[float] = None, dividend_yield: Optional[float] = None, budget: Optional[float] = None):
+def analyze_target(query: str, market_scope: str = "auto", cost: Optional[float] = None, dividend_yield: Optional[float] = None, budget: Optional[float] = None, chart_mode: str = "combo", selected_indicators: Optional[list[str]] = None):
     symbol = normalize_symbol(query, market_scope=market_scope)
     asset_type = detect_asset_type(query, symbol, market_scope=market_scope)
     if asset_type == "index":
-        return analyze_generic(symbol, query, "指數技術分析", "index", "指數", cost, dividend_yield, budget)
+        return analyze_generic(symbol, query, "指數技術分析", "index", "指數", cost, dividend_yield, budget, chart_mode, selected_indicators)
     if asset_type == "fx":
-        return analyze_generic(symbol, query, "匯率實戰策略", "fx", "匯率", cost, dividend_yield, budget)
+        return analyze_generic(symbol, query, "匯率實戰策略", "fx", "匯率", cost, dividend_yield, budget, chart_mode, selected_indicators)
     if asset_type == "bond":
-        return analyze_generic(symbol, query, "債券實戰策略", "bond", "債券", cost, dividend_yield, budget)
+        return analyze_generic(symbol, query, "債券實戰策略", "bond", "債券", cost, dividend_yield, budget, chart_mode, selected_indicators)
     if asset_type == "commodity":
-        return analyze_generic(symbol, query, "原物料技術分析", "commodity", "原物料", cost, dividend_yield, budget)
+        return analyze_generic(symbol, query, "原物料技術分析", "commodity", "原物料", cost, dividend_yield, budget, chart_mode, selected_indicators)
     if asset_type == "us_stock":
-        return analyze_generic(symbol, query, "美股技術分析", "us_stock", "美股", cost, dividend_yield, budget)
+        return analyze_generic(symbol, query, "美股技術分析", "us_stock", "美股", cost, dividend_yield, budget, chart_mode, selected_indicators)
     if asset_type == "uk_stock":
-        return analyze_generic(symbol, query, "英股技術分析", "uk_stock", "英股", cost, dividend_yield, budget)
+        return analyze_generic(symbol, query, "英股技術分析", "uk_stock", "英股", cost, dividend_yield, budget, chart_mode, selected_indicators)
     resolved = resolve_tw_stock_symbol(query)
     if resolved:
-        return analyze_generic(resolved["symbol"], query, "股票實戰策略", "stock", "股票", cost, dividend_yield, budget)
+        return analyze_generic(resolved["symbol"], query, "股票實戰策略", "stock", "股票", cost, dividend_yield, budget, chart_mode, selected_indicators)
     if query.strip().isdigit():
-        return analyze_generic(symbol, query, "股票實戰策略", "stock", "股票", cost, dividend_yield, budget)
+        return analyze_generic(symbol, query, "股票實戰策略", "stock", "股票", cost, dividend_yield, budget, chart_mode, selected_indicators)
     suggestions = suggest_tw_stock_names(query, limit=5)
     if suggestions:
         return None, "找不到對應標的，你是不是想查：<br>" + "<br>".join(f"• {x}" for x in suggestions)
@@ -1130,8 +1845,10 @@ def format_analysis_html(result: dict, portfolio: Optional[dict] = None):
     else:
         news_html = '<li>目前抓不到相關中文新聞，請稍後再試。</li>'
     news_impact = result.get("news_impact") or {}
+    cache_diag = result.get("cache_diag") or {}
     news_drivers = "".join(f"<li>{x}</li>" for x in news_impact.get("drivers", []))
     news_block = f'''<div class="section"><h3>最新五篇中文新聞</h3><div class="news-hint">搜尋關鍵字：{result.get('news_query')}</div><ul class="news-list">{news_html}</ul><div class="grid" style="margin-top:12px;"><div class="item"><span>事件面判斷</span><strong>{news_impact.get('view', '中性')}</strong></div><div class="item wide"><span>對投資策略可能影響</span><strong>{news_impact.get('advice', '無')}</strong></div></div><ul>{news_drivers if news_drivers else '<li>未抓到明顯事件字詞</li>'}</ul></div>'''
+    cache_block = f'''<div class="section"><h3>快取狀態</h3><div class="grid"><div class="item"><span>目前快取筆數</span><strong>{cache_diag.get('cache_items', 0)}</strong></div><div class="item"><span>進行中請求鎖</span><strong>{cache_diag.get('cache_inflight', 0)}</strong></div><div class="item"><span>價格歷史 TTL</span><strong>{cache_diag.get('yf_history_ttl', 0)} 秒</strong></div><div class="item"><span>官方資料 TTL</span><strong>{cache_diag.get('tw_official_ttl', 0)} 秒</strong></div><div class="item"><span>Yahoo 基本資料 TTL</span><strong>{cache_diag.get('yf_info_ttl', 0)} 秒</strong></div><div class="item"><span>新聞 TTL</span><strong>{cache_diag.get('news_ttl', 0)} 秒</strong></div><div class="item wide"><span>失敗快取 TTL</span><strong>{cache_diag.get('negative_ttl', 0)} 秒</strong></div></div></div>'''
 
     order_block = ""
     order_plan = result.get("order_plan")
@@ -1192,7 +1909,7 @@ def format_analysis_html(result: dict, portfolio: Optional[dict] = None):
         {cost_block}
         {portfolio_block}
         {news_block}
-        <div class="section"><h3>技術圖表</h3>{result.get('chart_html', '')}</div>
+        <div class="section"><h3>技術圖表</h3><ul><li>顯示模式：{'單一圖表' if result.get('chart_mode') == 'single' else '綜合圖表'}</li><li>已選技術指標：{", ".join(result.get('selected_indicators', []))}</li></ul>{result.get('chart_html', '')}</div>
     </div>
     '''
 
@@ -1203,14 +1920,14 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>投資查詢平台 v15</title>
+    <title>投資查詢平台 v16 台股官方資料源加強版</title>
     <style>
         body { margin: 0; font-family: "Microsoft JhengHei", Arial, sans-serif; background: #f5f7fb; color: #1f2937; }
         .container { max-width: 1300px; margin: 30px auto; padding: 20px; }
         .card { background: white; border-radius: 18px; padding: 24px; box-shadow: 0 8px 24px rgba(0,0,0,0.08); margin-bottom: 20px; }
         h1 { margin-top: 0; font-size: 30px; }
         .sub { color: #6b7280; margin-bottom: 18px; line-height: 1.8; }
-        form { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 1fr auto; gap: 12px; }
+        form { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr auto; gap: 12px; }
         input, select { padding: 14px 16px; border-radius: 12px; border: 1px solid #d1d5db; font-size: 16px; }
         button { padding: 14px 20px; border: none; border-radius: 12px; background: #2563eb; color: white; font-size: 16px; cursor: pointer; }
         .tips { margin-top: 14px; color: #4b5563; line-height: 1.8; }
@@ -1241,16 +1958,19 @@ HTML_TEMPLATE = """
         .news-meta, .news-hint { color: #6b7280; font-size: 13px; margin-top: 4px; }
         @media (max-width: 1100px) { form { grid-template-columns: 1fr 1fr 1fr; } }
         @media (max-width: 900px) { form { grid-template-columns: 1fr; } .grid { grid-template-columns: repeat(2, 1fr); } .wide { grid-column: span 2; } }
+        .indicator-box { margin-top: 14px; padding: 14px; background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 12px; }
+        .indicator-list { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-top: 10px; }
+        .indicator-list label { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; }
         @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } .wide { grid-column: span 1; } }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="card">
-            <h1>投資查詢平台 v15</h1>
+            <h1>投資查詢平台 v16 台股官方資料源加強版</h1>
             <div class="sub">
                 支援台股、美股、英股、台灣加權指數、匯率、原物料、債券 ETF。<br>
-                新增市場選項避免英股 / 美股代號重複、布林通道、財報分析、EPS 與 EPS 成長率、黃金交叉 / 死亡交叉預估、時事影響判讀、長期 / 當沖建議、下單金額計算、上漲目標價，以及多標的效率前緣與夏普值排序。
+                新增多來源財報備援（Yahoo / FMP / Alpha Vantage，需自備 API Key）、市場選項避免英股 / 美股代號重複、布林通道、財報分析、EPS 與 EPS 成長率、黃金交叉 / 死亡交叉預估、時事影響判讀、長期 / 當沖建議、下單金額計算、上漲目標價，以及多標的效率前緣與夏普值排序。
             </div>
             <form method="post">
                 <input type="text" name="query" placeholder="單一標的：台積電、AAPL、HSBA、黃金、美債" value="{{ query or '' }}" required>
@@ -1298,21 +2018,30 @@ def index():
     dividend_yield = ""
     budget = ""
     market_scope = "auto"
+    chart_mode = "combo"
     portfolio_symbols = ""
+    selected_indicators = ["price", "ma", "bollinger", "volume", "rsi", "kd"]
+
     if request.method == "GET":
         query = (request.args.get("q") or "").strip()
         cost = (request.args.get("cost") or "").strip()
         dividend_yield = (request.args.get("dividend_yield") or "").strip()
         budget = (request.args.get("budget") or "").strip()
         market_scope = (request.args.get("market_scope") or "auto").strip()
+        chart_mode = (request.args.get("chart_mode") or "combo").strip()
         portfolio_symbols = (request.args.get("portfolio_symbols") or "").strip()
+        selected_indicators = request.args.getlist("chart_indicators") or [x.strip() for x in (request.args.get("chart_indicators_csv") or "").split(",") if x.strip()] or selected_indicators
     else:
         query = (request.form.get("query") or "").strip()
         cost = (request.form.get("cost") or "").strip()
         dividend_yield = (request.form.get("dividend_yield") or "").strip()
         budget = (request.form.get("budget") or "").strip()
         market_scope = (request.form.get("market_scope") or "auto").strip()
+        chart_mode = (request.form.get("chart_mode") or "combo").strip()
         portfolio_symbols = (request.form.get("portfolio_symbols") or "").strip()
+        selected_indicators = request.form.getlist("chart_indicators") or selected_indicators
+
+    selected_indicators = normalize_indicator_selection(selected_indicators)
 
     parsed_cost = None
     parsed_dividend_yield = None
@@ -1331,7 +2060,7 @@ def index():
         try:
             parsed_budget = float(budget)
         except ValueError:
-            error = "預算格式錯誤，請輸入數字。"
+            error = "下單預算格式錯誤，請輸入數字。"
 
     portfolio = None
     if portfolio_symbols:
@@ -1341,22 +2070,16 @@ def index():
             portfolio = None
 
     if query and error is None:
-        result, err = analyze_target(query, market_scope=market_scope, cost=parsed_cost, dividend_yield=parsed_dividend_yield, budget=parsed_budget)
+        result, err = analyze_target(query, market_scope=market_scope, cost=parsed_cost, dividend_yield=parsed_dividend_yield, budget=parsed_budget, chart_mode=chart_mode, selected_indicators=selected_indicators)
         if err:
             error = err
         else:
             result_html = format_analysis_html(result, portfolio=portfolio)
     elif portfolio and error is None:
-        dummy = {
-            "title": "投資組合分析", "score": 0, "symbol": "-", "chinese_name": "-", "asset_type": "組合", "close": "-", "sma5": "-", "sma20": "-", "sma60": "-",
-            "rsi14": "-", "k": "-", "d": "-", "last_volume": "-", "vol_ma20": "-", "vol20": "-", "sharpe60": "-", "bb_upper": "-", "bb_mid": "-", "bb_lower": "-", "bb_width": "-",
-            "atr14": "-", "support": "-", "resistance": "-", "granville_rule": "-", "granville_signal": "-", "signal": "請查看下方效率前緣", "action": "此區塊僅顯示投資組合分析", "timing": "-", "holder_action": "-",
-            "fundamentals": {}, "show_dividend_section": False, "ma_cross": {"status": "-", "cross_type": "-", "days_to_cross": None, "reason": "-"}, "granville_points": [], "granville_reason": "-",
-            "reasons": [], "risk_note": [], "style_advice": {"long_term": "-", "day_trade": "-"}, "target_price": {"conservative": "-", "aggressive": "-", "basis": "-"}, "latest_news": [], "news_query": "-", "news_impact": {"view": "-", "advice": "-", "drivers": []}, "chart_html": ""
-        }
+        dummy = {"title": "投組效率前緣分析", "score": 0, "reasons": [], "risk_note": [], "chart_html": "", "chart_mode": chart_mode, "selected_indicators": selected_indicators}
         result_html = format_analysis_html(dummy, portfolio=portfolio)
 
-    return render_template_string(HTML_TEMPLATE, result_html=result_html, error=error, query=query, cost=cost, dividend_yield=dividend_yield, budget=budget, market_scope=market_scope, portfolio_symbols=portfolio_symbols)
+    return render_template_string(HTML_TEMPLATE, result_html=result_html, error=error, query=query, cost=cost, dividend_yield=dividend_yield, budget=budget, market_scope=market_scope, chart_mode=chart_mode, portfolio_symbols=portfolio_symbols, selected_indicators=selected_indicators)
 
 
 if __name__ == "__main__":
