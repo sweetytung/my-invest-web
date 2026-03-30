@@ -1705,33 +1705,146 @@ def create_chart_html(hist: pd.DataFrame, asset_type_label: str, chart_mode: str
     return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
-def build_result_dict(title: str, asset_type: str, asset_type_label: str, query: str, symbol: str, hist: pd.DataFrame, m: dict, scored: dict, cost_info=None, dividend_yield: Optional[float] = None, dividend_estimated: bool = False, fundamentals: Optional[dict] = None, budget: Optional[float] = None, chart_mode: str = "combo", selected_indicators: Optional[list[str]] = None):
+def build_result_dict(
+    title: str,
+    asset_type: str,
+    asset_type_label: str,
+    query: str,
+    symbol: str,
+    hist: pd.DataFrame,
+    m: dict,
+    scored: dict,
+    cost_info=None,
+    dividend_yield: Optional[float] = None,
+    dividend_estimated: bool = False,
+    fundamentals: Optional[dict] = None,
+    budget: Optional[float] = None,
+    chart_mode: str = "combo",
+    selected_indicators: Optional[list[str]] = None
+):
+    if selected_indicators is None:
+        selected_indicators = []
+
     digits = 4 if asset_type_label == "匯率" else 2
     yield_info = analyze_dividend_yield(dividend_yield, estimated=dividend_estimated)
     chinese_name = get_chinese_name(query, symbol, asset_type)
-    news_query = build_news_search_term(query, chinese_name, symbol, asset_type_label)
-    latest_news = fetch_latest_chinese_news(news_query, limit=5)
-    news_impact = infer_news_impact(latest_news, asset_type)
-    ma_cross = estimate_ma_cross_time(hist)
+
+    indicators = normalize_indicator_selection(selected_indicators)
+
+    # 輕量預設
+    latest_news = []
+    news_query = ""
+    news_impact = {"summary": "未啟用新聞分析", "bias": "中性"}
+    granville_points = []
+    chart_html = ""
+    ma_cross = None
+
+    # 只有需要時才抓新聞
+    # Render 輕量模式可先關掉
+    ENABLE_NEWS = False
+
+    if ENABLE_NEWS:
+        try:
+            news_query = build_news_search_term(query, chinese_name, symbol, asset_type_label)
+            latest_news = fetch_latest_chinese_news(news_query, limit=3)
+            news_impact = infer_news_impact(latest_news, asset_type)
+        except Exception as e:
+            print("新聞抓取失敗：", e)
+            latest_news = []
+            news_impact = {"summary": f"新聞抓取失敗：{e}", "bias": "中性"}
+
+    # 葛蘭碧點位可保留，但縮短 lookback
+    try:
+        granville_points = detect_granville_points(hist.tail(90), lookback=90)
+    except Exception as e:
+        print("葛蘭碧點位計算失敗：", e)
+        granville_points = []
+
+    try:
+        ma_cross = estimate_ma_cross_time(hist.tail(90))
+    except Exception as e:
+        print("均線交叉預估失敗：", e)
+        ma_cross = None
+
     style_advice = get_style_advice(asset_type, m, scored)
     target_price = calc_target_price(m)
     order_plan = calc_order_plan(m.get("close"), budget, asset_type, m.get("atr14"), target_price)
-    indicators = normalize_indicator_selection(selected_indicators)
+
+    # 沒選指標就不要畫圖
+    if indicators and chart_mode != "none":
+        try:
+            chart_html = create_chart_html(
+                hist.tail(90),   # 只給最近 90 筆
+                asset_type_label,
+                chart_mode=chart_mode,
+                selected_indicators=indicators
+            )
+        except Exception as e:
+            print("圖表生成失敗：", e)
+            chart_html = ""
+    else:
+        chart_html = ""
+
     return {
-        "title": f"{title}｜{query}", "asset_type": asset_type_label, "symbol": symbol, "chinese_name": chinese_name,
-        "close": safe_float(m["close"], digits), "sma5": safe_float(m["sma5"], digits), "sma20": safe_float(m["sma20"], digits), "sma60": safe_float(m["sma60"], digits),
-        "rsi14": safe_float(m["rsi14"], 1), "k": safe_float(m["k"], 1), "d": safe_float(m["d"], 1),
-        "last_volume": safe_float(m["last_volume"], 0), "vol_ma20": safe_float(m["vol_ma20"], 0), "vol20": safe_float(m["vol20"], 1),
-        "support": safe_float(m["support"], digits), "resistance": safe_float(m["resistance"], digits),
-        "bb_upper": safe_float(m["bb_upper"], digits), "bb_mid": safe_float(m["bb_mid"], digits), "bb_lower": safe_float(m["bb_lower"], digits), "bb_width": safe_float(m["bb_width"], 2),
-        "atr14": safe_float(m["atr14"], digits), "sharpe60": safe_float(m["sharpe60"], 2),
-        "score": scored["score"], "signal": scored["signal"], "action": scored["action"], "timing": scored.get("timing"), "holder_action": scored.get("holder_action"),
-        "reasons": scored["reasons"], "risk_note": scored["risk_note"], "granville_rule": scored.get("granville_rule"), "granville_signal": scored.get("granville_signal"), "granville_reason": scored.get("granville_reason"),
-        "granville_points": detect_granville_points(hist, lookback=180), "cost_info": cost_info,
-        "chart_mode": chart_mode, "selected_indicators": indicators, "chart_html": create_chart_html(hist, asset_type_label, chart_mode=chart_mode, selected_indicators=indicators),
-        "dividend_yield": dividend_yield, "is_high_yield": yield_info["is_high_yield"], "yield_level": yield_info["yield_level"], "yield_advice": yield_info["yield_advice"], "yield_source": yield_info["yield_source"],
-        "show_dividend_section": asset_type in {"stock", "us_stock", "uk_stock"}, "fundamentals": fundamentals, "news_query": news_query, "latest_news": latest_news,
-        "news_impact": news_impact, "style_advice": style_advice, "target_price": target_price, "order_plan": order_plan, "ma_cross": ma_cross,
+        "title": f"{title}｜{query}",
+        "asset_type": asset_type_label,
+        "symbol": symbol,
+        "chinese_name": chinese_name,
+
+        "close": safe_float(m["close"], digits),
+        "sma5": safe_float(m["sma5"], digits),
+        "sma20": safe_float(m["sma20"], digits),
+        "sma60": safe_float(m["sma60"], digits),
+        "rsi14": safe_float(m["rsi14"], 1),
+        "k": safe_float(m["k"], 1),
+        "d": safe_float(m["d"], 1),
+        "last_volume": safe_float(m["last_volume"], 0),
+        "vol_ma20": safe_float(m["vol_ma20"], 0),
+        "vol20": safe_float(m["vol20"], 1),
+        "support": safe_float(m["support"], digits),
+        "resistance": safe_float(m["resistance"], digits),
+        "bb_upper": safe_float(m["bb_upper"], digits),
+        "bb_mid": safe_float(m["bb_mid"], digits),
+        "bb_lower": safe_float(m["bb_lower"], digits),
+        "bb_width": safe_float(m["bb_width"], 2),
+        "atr14": safe_float(m["atr14"], digits),
+        "sharpe60": safe_float(m["sharpe60"], 2),
+
+        "score": scored["score"],
+        "signal": scored["signal"],
+        "action": scored["action"],
+        "timing": scored.get("timing"),
+        "holder_action": scored.get("holder_action"),
+        "reasons": scored["reasons"],
+        "risk_note": scored["risk_note"],
+        "granville_rule": scored.get("granville_rule"),
+        "granville_signal": scored.get("granville_signal"),
+        "granville_reason": scored.get("granville_reason"),
+
+        "granville_points": granville_points,
+        "cost_info": cost_info,
+
+        "chart_mode": chart_mode,
+        "selected_indicators": indicators,
+        "chart_html": chart_html,
+
+        "dividend_yield": dividend_yield,
+        "is_high_yield": yield_info["is_high_yield"],
+        "yield_level": yield_info["yield_level"],
+        "yield_advice": yield_info["yield_advice"],
+        "yield_source": yield_info["yield_source"],
+
+        "show_dividend_section": asset_type in {"stock", "us_stock", "uk_stock"},
+        "fundamentals": fundamentals,
+
+        "news_query": news_query,
+        "latest_news": latest_news,
+        "news_impact": news_impact,
+
+        "style_advice": style_advice,
+        "target_price": target_price,
+        "order_plan": order_plan,
+        "ma_cross": ma_cross,
     }
 
 
