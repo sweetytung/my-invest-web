@@ -615,9 +615,26 @@ def estimate_ma_cross_time(hist: pd.DataFrame):
         close_prev = float(joined["close"].iloc[-2])
         sma20_now = float(joined["s20"].iloc[-1])
         sma20_prev = float(joined["s20"].iloc[-2])
+        sma60_now = float(joined["s60"].iloc[-1])
+        sma20_slope_series = joined["s20"].diff().tail(5)
+        sma60_slope_series = joined["s60"].diff().tail(5)
+        price_slope_series = joined["close"].diff().tail(5)
+        sma20_slope = float(sma20_slope_series.mean()) if not pd.isna(sma20_slope_series.mean()) else 0.0
+        sma60_slope = float(sma60_slope_series.mean()) if not pd.isna(sma60_slope_series.mean()) else 0.0
+        price_slope = float(price_slope_series.mean()) if not pd.isna(price_slope_series.mean()) else 0.0
         granville_now = granville_signal_from_values(close_now, close_prev, sma20_now, sma20_prev) or {
             "rule": "中性", "signal": "未出現明確訊號", "reason": "目前價格與均線關係沒有明顯買賣訊號"
         }
+
+        def build_cross_price(days_to_cross: int):
+            projected_s20 = sma20_now + sma20_slope * days_to_cross
+            projected_s60 = sma60_now + sma60_slope * days_to_cross
+            projected_cross_ma = (projected_s20 + projected_s60) / 2
+            projected_close = close_now + price_slope * days_to_cross
+            return {
+                "cross_price": round(float(projected_cross_ma), 2),
+                "projected_close": round(float(projected_close), 2),
+            }
 
         if weighted_change is None or abs(weighted_change) < 1e-9:
             return {
@@ -625,6 +642,8 @@ def estimate_ma_cross_time(hist: pd.DataFrame):
                 "days_to_cross": None,
                 "cross_type": None,
                 "estimated_date": None,
+                "cross_price": None,
+                "projected_close": None,
                 "confidence": "低",
                 "granville_basis": granville_now["rule"],
                 "reason": f"均線差距變化太小，暫時無法依葛蘭碧節奏估算；目前屬 {granville_now['rule']}。",
@@ -655,17 +674,20 @@ def estimate_ma_cross_time(hist: pd.DataFrame):
             elif granville_now["rule"] in {"B2", "B4"}:
                 adjustment = 1.4
 
-        gap_ratio = abs(current) / max(abs(float(joined["s60"].iloc[-1])), 1e-9) * 100
+        gap_ratio = abs(current) / max(abs(sma60_now), 1e-9) * 100
         confidence = "高" if gap_ratio <= 1.5 else ("中" if gap_ratio <= 3.5 else "低")
 
         if next_cross:
             days = int(max(1, round(base_days * adjustment)))
             est_date = (pd.Timestamp(joined.index[-1]) + pd.tseries.offsets.BDay(days)).strftime("%Y-%m-%d")
+            cross_price_info = build_cross_price(days)
             return {
                 "status": f"可能接近{next_cross}",
                 "days_to_cross": days,
                 "cross_type": next_cross,
                 "estimated_date": est_date,
+                "cross_price": cross_price_info["cross_price"],
+                "projected_close": cross_price_info["projected_close"],
                 "confidence": confidence,
                 "granville_basis": granville_now["rule"],
                 "reason": f"20MA 與 60MA 的差距正朝 {next_cross} 方向收斂，並依目前葛蘭碧 {granville_now['rule']}（{granville_now['signal']}）調整推估天數。",
@@ -677,13 +699,14 @@ def estimate_ma_cross_time(hist: pd.DataFrame):
             "days_to_cross": None,
             "cross_type": None,
             "estimated_date": None,
+            "cross_price": None,
+            "projected_close": None,
             "confidence": confidence,
             "granville_basis": granville_now["rule"],
             "reason": f"{trend}；目前葛蘭碧判斷為 {granville_now['rule']}（{granville_now['signal']}），尚未形成明確交叉收斂。",
         }
     except Exception:
         return None
-
 
 def infer_news_impact(news_items: list[dict], asset_type: str):
     positive_keywords = ["創新高", "成長", "上修", "合作", "擴產", "利多", "訂單", "獲利", "降息", "回購"]
@@ -1306,7 +1329,7 @@ def format_analysis_html(result: dict, portfolio: Optional[dict] = None):
         granville_recent_block = "<div class='section'><h3>葛蘭碧買賣點標記</h3><ul><li>近 180 個交易日尚未偵測到明確的葛蘭碧買賣點。</li></ul></div>"
 
     ma_cross = result.get("ma_cross") or {}
-    cross_block = f"""<div class=\"section\"><h3>黃金交叉 / 死亡交叉預估</h3><div class=\"grid\"><div class=\"item\"><span>目前狀態</span><strong>{ma_cross.get('status', '未取得')}</strong></div><div class=\"item\"><span>預估交叉類型</span><strong>{ma_cross.get('cross_type', '暫無')}</strong></div><div class=\"item\"><span>預估時間</span><strong>{str(ma_cross.get('days_to_cross')) + ' 個交易日' if ma_cross.get('days_to_cross') else '暫無法估算'}</strong></div><div class=\"item wide\"><span>說明</span><strong>{ma_cross.get('reason', '')}</strong></div></div></div>"""
+    cross_block = f"""<div class=\"section\"><h3>黃金交叉 / 死亡交叉預估</h3><div class=\"grid\"><div class=\"item\"><span>目前狀態</span><strong>{ma_cross.get('status', '未取得')}</strong></div><div class=\"item\"><span>預估交叉類型</span><strong>{ma_cross.get('cross_type', '暫無')}</strong></div><div class=\"item\"><span>預估時間</span><strong>{str(ma_cross.get('days_to_cross')) + ' 個交易日' if ma_cross.get('days_to_cross') else '暫無法估算'}</strong></div><div class=\"item\"><span>預估日期</span><strong>{ma_cross.get('estimated_date', '暫無') or '暫無'}</strong></div><div class=\"item\"><span>交叉預定價格</span><strong>{ma_cross.get('cross_price', '暫無') if ma_cross.get('cross_price') is not None else '暫無'}</strong></div><div class=\"item\"><span>預估當日股價</span><strong>{ma_cross.get('projected_close', '暫無') if ma_cross.get('projected_close') is not None else '暫無'}</strong></div><div class=\"item\"><span>信心水準</span><strong>{ma_cross.get('confidence', '未取得')}</strong></div><div class=\"item\"><span>葛蘭碧依據</span><strong>{ma_cross.get('granville_basis', '未取得')}</strong></div><div class=\"item wide\"><span>說明</span><strong>{ma_cross.get('reason', '')}</strong></div></div></div>"""
 
     target_price = result.get("target_price") or {}
     target_block = f"""<div class=\"section\"><h3>上漲目標價</h3><div class=\"grid\"><div class=\"item\"><span>保守目標價</span><strong>{target_price.get('conservative', '未取得')}</strong></div><div class=\"item\"><span>積極目標價</span><strong>{target_price.get('aggressive', '未取得')}</strong></div><div class=\"item wide\"><span>估算依據</span><strong>{target_price.get('basis', '無')}</strong></div></div></div>"""
@@ -1393,7 +1416,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>投資查詢平台 v16</title>
+    <title>投資查詢平台 v16.1</title>
     <style>
         body { margin: 0; font-family: "Microsoft JhengHei", Arial, sans-serif; background: #f5f7fb; color: #1f2937; }
         .container { max-width: 1300px; margin: 30px auto; padding: 20px; }
@@ -1437,7 +1460,7 @@ HTML_TEMPLATE = """
 <body>
     <div class="container">
         <div class="card">
-            <h1>投資查詢平台 v16</h1>
+            <h1>投資查詢平台 v16.1</h1>
             <div class="sub">
                 支援台股、美股、英股、台灣加權指數、匯率、原物料、債券 ETF。<br>
                 新增市場選項避免英股 / 美股代號重複，並支援英股公司中文名、英文名與常見簡稱對照查詢；同時加入依葛蘭碧八大法則調整的黃金交叉 / 死亡交叉到達時間預估、布林通道、財報分析、EPS 與 EPS 成長率、時事影響判讀、長期 / 當沖建議、下單金額計算、上漲目標價，以及多標的效率前緣與夏普值排序。
@@ -1544,7 +1567,7 @@ def index():
             "title": "投資組合分析", "score": 0, "symbol": "-", "chinese_name": "-", "asset_type": "組合", "close": "-", "sma5": "-", "sma20": "-", "sma60": "-",
             "rsi14": "-", "k": "-", "d": "-", "last_volume": "-", "vol_ma20": "-", "vol20": "-", "sharpe60": "-", "bb_upper": "-", "bb_mid": "-", "bb_lower": "-", "bb_width": "-",
             "atr14": "-", "support": "-", "resistance": "-", "granville_rule": "-", "granville_signal": "-", "signal": "請查看下方效率前緣", "action": "此區塊僅顯示投資組合分析", "timing": "-", "holder_action": "-",
-            "fundamentals": {}, "show_dividend_section": False, "ma_cross": {"status": "-", "cross_type": "-", "days_to_cross": None, "reason": "-"}, "granville_points": [], "granville_reason": "-",
+            "fundamentals": {}, "show_dividend_section": False, "ma_cross": {"status": "-", "cross_type": "-", "days_to_cross": None, "estimated_date": "-", "cross_price": None, "projected_close": None, "confidence": "-", "granville_basis": "-", "reason": "-"}, "granville_points": [], "granville_reason": "-",
             "reasons": [], "risk_note": [], "style_advice": {"long_term": "-", "day_trade": "-"}, "target_price": {"conservative": "-", "aggressive": "-", "basis": "-"}, "latest_news": [], "news_query": "-", "news_impact": {"view": "-", "advice": "-", "drivers": []}, "chart_html": ""
         }
         result_html = format_analysis_html(dummy, portfolio=portfolio)
